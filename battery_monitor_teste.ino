@@ -1,11 +1,13 @@
 /*
- * Projeto: Monitoramento de Baterias com ESP32-S3, ADS1115 e SPIFFS
+ * Projeto: Monitoramento Avançado de Baterias LiFePO4
+ * ESP32-S3-DevKitC-1 + ADS1115
  * Funcionalidades:
- * - Leitura de 4 células de bateria via ADS1115 (I2C)
- * - Cálculo do estado de carga
- * - Armazenamento local em SPIFFS
- * - Interface Web com atualização em tempo real via WebSocket
- * - Indicadores visuais via LED
+ * - Leitura precisa de 4 células (16 bits)
+ * - Cálculo de estado de carga
+ * - Proteção contra sobretensão
+ * - Armazenamento em SPIFFS com rotação
+ * - Interface Web/WebSocket
+ * - Indicadores visuais com LEDs
  */
 
 #include <Arduino.h>
@@ -14,84 +16,116 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Adafruit_ADS1X15.h>
-#include <SPIFFS.h>  // Alterado para SPIFFS
+#include <SPIFFS.h>
 
-// Altere o tamanho dos arrays e loops for
+// Configuração do Hardware
 #define NUM_BATTERIES 4
-
-// Definições de bateria
-const int16_t MIN_BATTERY_VOLTAGE = 3000;  // 3000mV = 0%
-const int16_t MAX_BATTERY_VOLTAGE = 4200;  // 4200mV = 100%
-const size_t MAX_FILE_SIZE = 512000;       // 512KB (metade da partição típica)
-
-// Definições dos pinos
-const int LED_PINS[] = {12, 13, 14, 15};
+const int LED_PINS[NUM_BATTERIES] = {12, 13, 14, 15};
 const int I2C_SDA = 17;
 const int I2C_SCL = 18;
 
-// Configurações WiFi
-const char* ssid = "SUA_REDE_WIFI";
+// Parâmetros das Baterias LiFePO4
+const int16_t MIN_VOLTAGE = 2800;    // 2.8V (0%)
+const int16_t MAX_VOLTAGE = 3600;    // 3.6V (100%)
+const int16_t OVER_VOLTAGE = 3700;   // 3.7V (limite)
+const size_t MAX_FILE_SIZE = 512000; // 512KB (50% da partição)
+
+// WiFi
+const char* ssid = "SUA_REDE";
 const char* password = "SUA_SENHA";
 
-// Intervalos de tempo
-const unsigned long READ_INTERVAL = 1000; // 1 segundo
-const unsigned long SAVE_INTERVAL = 60000; // 1 minuto
+// Intervalos (ms)
+const unsigned long READ_INTERVAL = 5000;    // 5s
+const unsigned long SAVE_INTERVAL = 300000;  // 5min
 const unsigned long RECONNECT_INTERVAL = 30000;
 
-// Objetos globais
+// Objetos Globais
 Adafruit_ADS1115 ads;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// Estrutura para dados da bateria
 struct BatteryData {
   int16_t voltages[NUM_BATTERIES];
   int8_t percentages[NUM_BATTERIES];
   int16_t totalVoltage;
   int8_t totalPercentage;
+  bool overVoltage;
 };
 
-// Variáveis globais
-unsigned long lastReadTime = 0;
-unsigned long lastSaveTime = 0;
-unsigned long lastReconnectAttempt = 0;
-
-// Protótipos de funções
+// Protótipos
+void initHardware();
 void initWiFi();
+void initSPIFFS();
 void initWebServer();
-void initStorage();
-void onWebSocketEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType, void*, uint8_t*, size_t);
-void readBatteryData(BatteryData*);
+void readBatteries(BatteryData*);
 void calculatePercentages(BatteryData*);
+void checkSafety(BatteryData*);
 void updateLEDs(const BatteryData*);
-void saveDataToFile(const BatteryData*);
-void rotateDataFiles();
-void sendDataToClients(const BatteryData*);
+void saveData(const BatteryData*);
+void rotateFiles();
+void sendWSData(const BatteryData*);
+void onWebSocketEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType, void*, uint8_t*, size_t);
+void debugPrintData(const BatteryData*);
 
-// Página HTML (idêntica à versão anterior)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <title>Monitor de Baterias</title>
   <style>
-    .battery { width: 100px; height: 200px; border: 3px solid #000; position: relative; }
-    .level { position: absolute; bottom: 0; width: 100%; background: #4CAF50; }
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .battery { 
+      width: 60px; height: 120px; border: 2px solid #333; 
+      position: relative; display: inline-block; margin: 10px;
+    }
+    .level { 
+      position: absolute; bottom: 0; width: 100%; 
+      background: #4CAF50; transition: height 0.5s;
+    }
+    .alarm { background: #f44336 !important; }
+    .info { margin-top: 5px; text-align: center; }
+    #status { 
+      padding: 10px; margin: 10px 0; border-radius: 5px;
+      background: #f8f8f8; font-weight: bold;
+    }
   </style>
 </head>
 <body>
-  <h1>Monitor de Baterias</h1>
+  <h1>Monitor de Baterias LiFePO4</h1>
+  <div id="status">Conectando...</div>
   <div id="batteries"></div>
+  <p><a href="/download" download>Baixar Dados Completos</a></p>
+  
   <script>
     const ws = new WebSocket('ws://' + location.hostname + '/ws');
-    ws.onmessage = function(event) {
+    const statusDiv = document.getElementById('status');
+    
+    ws.onopen = () => statusDiv.textContent = "Conectado - Dados em Tempo Real";
+    ws.onclose = () => statusDiv.textContent = "Conexão Perdida - Tentando reconectar...";
+    
+    ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       let html = '';
+      
       data.voltages.forEach((v, i) => {
-        html += `<div><div class="battery"><div class="level" style="height:${data.percentages[i]}%"></div></div>
-                <p>Bateria ${i+1}: ${v}mV (${data.percentages[i]}%)</p></div>`;
+        html += `
+        <div class="battery-container">
+          <div class="battery ${data.alarm ? 'alarm' : ''}">
+            <div class="level" style="height:${data.percentages[i]}%"></div>
+          </div>
+          <div class="info">
+            Célula ${i+1}:<br>
+            ${(v/1000).toFixed(2)}V<br>
+            ${data.percentages[i]}%
+          </div>
+        </div>`;
       });
+      
       document.getElementById('batteries').innerHTML = html;
+      statusDiv.textContent = data.alarm 
+        ? "ALARME: Sobretensão Detectada!" 
+        : `Sistema OK - Total: ${(data.totalVoltage/1000).toFixed(2)}V (${data.totalPercentage}%)`;
+      statusDiv.style.background = data.alarm ? "#ffebee" : "#e8f5e9";
     };
   </script>
 </body>
@@ -100,170 +134,110 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 void setup() {
   Serial.begin(115200);
+  initHardware();
+  initSPIFFS();
+  initWiFi();
+  initWebServer();
   
-  // Inicializa LEDs
-  for (int i = 0; i < 4; i++) {
+  Serial.println("\nSistema Iniciado");
+  Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+}
+
+void loop() {
+  static BatteryData data;
+  static unsigned long lastRead = 0, lastSave = 0, lastReconnect = 0;
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED && now - lastReconnect >= RECONNECT_INTERVAL) {
+    WiFi.reconnect();
+    lastReconnect = now;
+  }
+
+  if (now - lastRead >= READ_INTERVAL) {
+    readBatteries(&data);
+    calculatePercentages(&data);
+    checkSafety(&data);
+    updateLEDs(&data);
+    sendWSData(&data);
+    debugPrintData(&data);
+    lastRead = now;
+  }
+
+  if (now - lastSave >= SAVE_INTERVAL) {
+    saveData(&data);
+    lastSave = now;
+  }
+
+  ws.cleanupClients();
+  delay(10);
+}
+
+void initHardware() {
+  // Configura LEDs
+  for (int i = 0; i < NUM_BATTERIES; i++) {
     pinMode(LED_PINS[i], OUTPUT);
     digitalWrite(LED_PINS[i], LOW);
   }
 
-  // Inicializa I2C e ADS1115
+  // Inicia I2C e ADS1115
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!ads.begin(0x48)) {
     Serial.println("Falha ao iniciar ADS1115!");
-    while (1);
+    while(1);
   }
-  ads.setGain(GAIN_ONE);
-
-  // Inicializa armazenamento com SPIFFS
-  initStorage();
-
-  // Conecta WiFi
-  initWiFi();
-
-  // Inicializa servidor web
-  initWebServer();
-  
-  Serial.println("\nInformações do SPIFFS:");
-  checkStorageSpace();
-  listAllFiles();
-  
-  // Descomente apenas se precisar formatar
-  // formatSPIFFS();
+  ads.setGain(GAIN_ONE); // ±4.096V
 }
 
-void loop() {
-  static BatteryData currentData;
-  unsigned long currentMillis = millis();
-
-  // Reconecta WiFi se necessário
-  if (WiFi.status() != WL_CONNECTED && currentMillis - lastReconnectAttempt >= RECONNECT_INTERVAL) {
-    Serial.println("Reconectando WiFi...");
-    WiFi.disconnect();
-    WiFi.reconnect();
-    lastReconnectAttempt = currentMillis;
+void initWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+  
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
   }
-
-  // Leitura periódica das baterias
-  if (currentMillis - lastReadTime >= READ_INTERVAL) {
-    readBatteryData(&currentData);
-    calculatePercentages(&currentData);
-    updateLEDs(&currentData);
-    sendDataToClients(&currentData);
-    lastReadTime = currentMillis;
-  }
-
-  // Armazenamento periódico
-  if (currentMillis - lastSaveTime >= SAVE_INTERVAL) {
-    saveDataToFile(&currentData);
-    lastSaveTime = currentMillis;
-  }
-
-  // Limpa clientes desconectados do WebSocket
-  ws.cleanupClients();
-
-  // Verificação periódica a cada hora
-  static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 3600000) {
-    checkStorageSpace();
-    lastCheck = millis();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nFalha na conexão WiFi!");
   }
 }
 
-/**
- * Inicializa o SPIFFS
- */
-void initStorage() {
-  if (!SPIFFS.begin(true)) {  // true = formata se montagem falhar
-    Serial.println("Erro ao montar SPIFFS");
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Falha ao montar SPIFFS");
     return;
   }
-  
-  // Verifica se o arquivo existe, se não, cria com cabeçalho
-  if (!SPIFFS.exists("/battery_data.csv")) {
-    File file = SPIFFS.open("/battery_data.csv", FILE_WRITE);
+
+  if (!SPIFFS.exists("/index.html")) {
+    File file = SPIFFS.open("/index.html", FILE_WRITE);
     if (file) {
-      file.println("Timestamp,Volt1,Volt2,Volt3,Volt4,Percent1,Percent2,Percent3,Percent4,TotalVoltage,TotalPercent");
+      file.print(index_html);
       file.close();
-      Serial.println("Arquivo CSV criado com cabeçalho");
-    } else {
-      Serial.println("Erro ao criar arquivo");
     }
   }
-  Serial.println("SPIFFS inicializado");
+
+  if (!SPIFFS.exists("/data.csv")) {
+    File file = SPIFFS.open("/data.csv", FILE_WRITE);
+    if (file) {
+      file.println("Timestamp,Volt1,Volt2,Volt3,Volt4,Percent1,Percent2,Percent3,Percent4,TotalVoltage,TotalPercent,Alarme");
+      file.close();
+    }
+  }
+
+  Serial.printf("SPIFFS: %d/%d bytes usados\n", SPIFFS.usedBytes(), SPIFFS.totalBytes());
 }
 
-/**
- * Salva dados no arquivo CSV usando SPIFFS
- */
-void saveDataToFile(const BatteryData *data) {
-  // Verifica espaço disponível
-  if (SPIFFS.usedBytes() > MAX_FILE_SIZE) {
-    rotateDataFiles();
-  }
-
-  File file = SPIFFS.open("/battery_data.csv", FILE_APPEND);
-  if (!file) {
-    Serial.println("Erro ao abrir arquivo para escrita");
-    return;
-  }
-
-  // Formato mais robusto com verificação de escrita
-  size_t bytesWritten = file.print(millis());
-  for (int i = 0; i < NUM_BATTERIES; i++) {
-    bytesWritten += file.print(",");
-    bytesWritten += file.print(data->voltages[i]);
-  }
-  for (int i = 0; i < NUM_BATTERIES; i++) {
-    bytesWritten += file.print(",");
-    bytesWritten += file.print(data->percentages[i]);
-  }
-  bytesWritten += file.print(",");
-  bytesWritten += file.print(data->totalVoltage);
-  bytesWritten += file.print(",");
-  bytesWritten += file.println(data->totalPercentage);
-
-  if (bytesWritten == 0) {
-    Serial.println("Falha ao escrever no arquivo!");
-  } else {
-    Serial.printf("Dados salvos (%d bytes)\n", bytesWritten);
-  }
-  
-  file.close();
-}
-
-// Adicione esta nova função para rotacionar arquivos
-void rotateDataFiles() {
-  Serial.println("Rotacionando arquivos de dados...");
-  
-  if (SPIFFS.exists("/battery_data_old.csv")) {
-    SPIFFS.remove("/battery_data_old.csv");
-  }
-  
-  if (SPIFFS.exists("/battery_data.csv")) {
-    SPIFFS.rename("/battery_data.csv", "/battery_data_old.csv");
-  }
-  
-  // Cria novo arquivo
-  File file = SPIFFS.open("/battery_data.csv", FILE_WRITE);
-  if (file) {
-    file.println("Timestamp,Volt1,Volt2,Volt3,Volt4,Percent1,Percent2,Percent3,Percent4,TotalVoltage,TotalPercent");
-    file.close();
-  }
-}
-
-/**
- * Inicializa servidor web com rota para download
- */
 void initWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
+    request->send(SPIFFS, "/index.html", "text/html");
   });
 
-  // Rota para download dos dados
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (SPIFFS.exists("/battery_data.csv")) {
-      request->send(SPIFFS, "/battery_data.csv", "text/csv");
+    if (SPIFFS.exists("/data.csv")) {
+      request->send(SPIFFS, "/data.csv", "text/csv", true);
     } else {
       request->send(404, "text/plain", "Arquivo não encontrado");
     }
@@ -274,116 +248,147 @@ void initWebServer() {
   server.begin();
 }
 
-/**
- * Inicializa a conexão WiFi
- */
-void initWiFi() {
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando ao WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConectado! IP: " + WiFi.localIP().toString());
-}
-
-/**
- * Lê os dados das baterias do ADS1115
- * @param data Ponteiro para estrutura BatteryData
- */
-void readBatteryData(BatteryData *data) {
+void readBatteries(BatteryData *data) {
   data->totalVoltage = 0;
-  
-  for (int i = 0; i < 4; i++) {
-    // Lê valor do ADC (16 bits)
+  data->overVoltage = false;
+
+  for (int i = 0; i < NUM_BATTERIES; i++) {
     int16_t adc = ads.readADC_SingleEnded(i);
+    data->voltages[i] = adc * 0.125F; // 0.125mV por bit
     
-    // Converte para mV (GAIN_ONE: 0.125mV por bit)
-    data->voltages[i] = adc * 0.125F;
-    data->totalVoltage += data->voltages[i];
+    if (data->voltages[i] > OVER_VOLTAGE) {
+      data->overVoltage = true;
+    }
     
-    // Limita valores negativos (pode ocorrer com ruído)
-    if (data->voltages[i] < 0) data->voltages[i] = 0;
+    data->totalVoltage += constrain(data->voltages[i], 0, OVER_VOLTAGE);
   }
 }
 
-/**
- * Calcula as porcentagens de carga baseado nas tensões
- * @param data Ponteiro para estrutura BatteryData
- */
 void calculatePercentages(BatteryData *data) {
   data->totalPercentage = 0;
   
   for (int i = 0; i < NUM_BATTERIES; i++) {
-    data->percentages[i] = map(data->voltages[i], 
-                              MIN_BATTERY_VOLTAGE, 
-                              MAX_BATTERY_VOLTAGE, 
-                              0, 100);
-    data->percentages[i] = constrain(data->percentages[i], 0, 100);
+    data->percentages[i] = constrain(
+      map(data->voltages[i], MIN_VOLTAGE, MAX_VOLTAGE, 0, 100),
+      0, 100
+    );
     data->totalPercentage += data->percentages[i];
   }
+  
   data->totalPercentage /= NUM_BATTERIES;
 }
-  
-  // Calcula média
-  data->totalPercentage /= 4;
+
+void checkSafety(BatteryData *data) {
+  if (data->overVoltage) {
+    Serial.println("ALERTA: Sobretensão detectada!");
+    // Aqui você pode adicionar ações de proteção como desligar cargas
+  }
 }
 
-/**
- * Atualiza os LEDs conforme estado das baterias
- * @param data Ponteiro para estrutura BatteryData
- */
 void updateLEDs(const BatteryData *data) {
-  for (int i = 0; i < 4; i++) {
-    if (data->percentages[i] >= 90) {
-      digitalWrite(LED_PINS[i], HIGH);  // Cheia - LED aceso
-    } else if (data->percentages[i] <= 10) {
-      digitalWrite(LED_PINS[i], LOW);   // Vazia - LED apagado
+  for (int i = 0; i < NUM_BATTERIES; i++) {
+    if (data->overVoltage) {
+      digitalWrite(LED_PINS[i], (millis() % 200) < 100); // Pisca rápido
+    } else if (data->percentages[i] >= 95) {
+      digitalWrite(LED_PINS[i], HIGH); // Carga completa
+    } else if (data->percentages[i] <= 5) {
+      digitalWrite(LED_PINS[i], LOW); // Bateria vazia
     } else {
       // Pisca em frequência proporcional à carga
-      int interval = map(data->percentages[i], 10, 90, 200, 1000);
+      int interval = map(data->percentages[i], 5, 95, 200, 2000);
       digitalWrite(LED_PINS[i], (millis() % interval) < (interval / 2));
     }
   }
 }
 
-/**
- * Envia dados para clientes via WebSocket
- * @param data Ponteiro para estrutura BatteryData
- */
-void sendDataToClients(const BatteryData *data) {
-  // Prepara JSON com os dados
+void saveData(const BatteryData *data) {
+  if (SPIFFS.usedBytes() > MAX_FILE_SIZE) {
+    rotateFiles();
+  }
+
+  File file = SPIFFS.open("/data.csv", FILE_APPEND);
+  if (!file) {
+    Serial.println("Erro ao abrir arquivo!");
+    return;
+  }
+
+  String line = String(millis());
+  for (int i = 0; i < NUM_BATTERIES; i++) {
+    line += "," + String(data->voltages[i]);
+  }
+  for (int i = 0; i < NUM_BATTERIES; i++) {
+    line += "," + String(data->percentages[i]);
+  }
+  line += "," + String(data->totalVoltage);
+  line += "," + String(data->totalPercentage);
+  line += "," + String(data->overVoltage ? 1 : 0);
+
+  if (!file.println(line)) {
+    Serial.println("Falha na escrita!");
+  }
+  
+  file.close();
+}
+
+void rotateFiles() {
+  Serial.println("Rotacionando arquivos...");
+  
+  if (SPIFFS.exists("/data_old.csv")) {
+    SPIFFS.remove("/data_old.csv");
+  }
+  
+  if (SPIFFS.exists("/data.csv")) {
+    SPIFFS.rename("/data.csv", "/data_old.csv");
+  }
+  
+  File file = SPIFFS.open("/data.csv", FILE_WRITE);
+  if (file) {
+    file.println("Timestamp,Volt1,Volt2,Volt3,Volt4,Percent1,Percent2,Percent3,Percent4,TotalVoltage,TotalPercent,Alarme");
+    file.close();
+  }
+}
+
+void sendWSData(const BatteryData *data) {
   String json = "{";
-  json += "\"voltages\":[" + String(data->voltages[0]) + "," + String(data->voltages[1]) + "," + 
-          String(data->voltages[2]) + "," + String(data->voltages[3]) + "],";
-  json += "\"percentages\":[" + String(data->percentages[0]) + "," + String(data->percentages[1]) + "," + 
-          String(data->percentages[2]) + "," + String(data->percentages[3]) + "],";
-  json += "\"totalVoltage\":" + String(data->totalVoltage) + ",";
-  json += "\"totalPercentage\":" + String(data->totalPercentage);
+  json += "\"voltages\":[" + String(data->voltages[0]);
+  for (int i = 1; i < NUM_BATTERIES; i++) {
+    json += "," + String(data->voltages[i]);
+  }
+  json += "],\"percentages\":[" + String(data->percentages[0]);
+  for (int i = 1; i < NUM_BATTERIES; i++) {
+    json += "," + String(data->percentages[i]);
+  }
+  json += "],\"totalVoltage\":" + String(data->totalVoltage);
+  json += ",\"totalPercentage\":" + String(data->totalPercentage);
+  json += ",\"alarm\":" + String(data->overVoltage ? "true" : "false");
   json += "}";
   
-  // Envia para todos clientes conectados
   ws.textAll(json);
 }
 
-/**
- * Manipulador de eventos do WebSocket
- */
+void debugPrintData(const BatteryData *data) {
+  Serial.println("\n--- Dados Atuais ---");
+  for (int i = 0; i < NUM_BATTERIES; i++) {
+    Serial.printf("Bateria %d: %.2fV (%d%%) %s\n", 
+                 i+1, 
+                 data->voltages[i]/1000.0, 
+                 data->percentages[i],
+                 (data->voltages[i] > OVER_VOLTAGE) ? "[ALERTA!]" : "");
+  }
+  Serial.printf("Total: %.2fV (%d%%)\n", data->totalVoltage/1000.0, data->totalPercentage);
+  Serial.printf("Status: %s\n", data->overVoltage ? "ALARME - SOBRETENSÃO" : "Normal");
+  Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.println("-------------------");
+}
+
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, 
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  switch (type) {
-    case WS_EVT_CONNECT:
-      Serial.printf("Cliente WebSocket #%u conectado\n", client->id());
-      break;
-    case WS_EVT_DISCONNECT:
-      Serial.printf("Cliente WebSocket #%u desconectado\n", client->id());
-      break;
-    case WS_EVT_DATA:
-      // Pode tratar mensagens recebidas aqui
-      break;
-    case WS_EVT_ERROR:
-      // Trata erros
-      break;
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("Cliente #%u conectado\n", client->id());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("Cliente #%u desconectado\n", client->id());
+  } else if (type == WS_EVT_ERROR) {
+    Serial.printf("Erro WS: %u\n", *((uint16_t*)arg));
   }
 }
 /**
