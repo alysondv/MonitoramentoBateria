@@ -21,8 +21,8 @@
 // =============== CONFIGURAÇÕES ===============
 #define NUM_BATTERIES 4
 const uint8_t LED_PINS[NUM_BATTERIES] = {12, 13, 14, 15};
-const uint8_t I2C_SDA = 41;
-const uint8_t I2C_SCL = 42;
+const uint8_t I2C_SDA = 42;
+const uint8_t I2C_SCL = 41;
 
 // Parâmetros das Baterias LiPo (por célula)
 const uint16_t MIN_VOLTAGE = 3000;    // 3.0V (0%) - NUNCA descarregar abaixo disso!
@@ -436,16 +436,20 @@ bool readBatteries(BatteryData* data) {
 
     for (uint8_t s = 0; s < samples; s++) {
       sum += ads.readADC_SingleEnded(i);
-      delayMicroseconds(500); // Pequeno delay para estabilizar entre leituras
+      delayMicroseconds(500);
     }
 
     int16_t avgRaw = sum / samples;
-    int16_t voltage = avgRaw * 0.1875; // Conversão para mV (baseado no ganho padrão)
+    int16_t voltage = avgRaw * 0.1875;
 
-    // Aplicação do filtro IIR
-    filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
+    // Corrigir acúmulo infinito: inicializa o filtro com a 1ª leitura válida
+    if (filteredVoltages[i] == 0) {
+      filteredVoltages[i] = voltage;
+    } else {
+      filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
+    }
+
     data->voltages[i] = static_cast<int16_t>(filteredVoltages[i]);
-
     data->totalVoltage += data->voltages[i];
 
     if (data->voltages[i] > OVER_VOLTAGE) data->overVoltage = true;
@@ -455,6 +459,7 @@ bool readBatteries(BatteryData* data) {
 
   return true;
 }
+
 
 //A curva que aplicamos aqui aproxima o comportamento real da descarga LiPo, que não é linear:
 //a maior parte da variação de carga ocorre entre 3,7V e 4,0V.
