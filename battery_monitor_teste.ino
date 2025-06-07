@@ -32,8 +32,8 @@ const uint16_t CRITICAL_LOW = 3200;   // 3.2V (nível crítico)
 const size_t MAX_FILE_SIZE = 512000;  // 512KB (50% da partição)
 
 // Configuração WiFi
-const char* ssid = "Francisca";
-const char* password = "Francisca2909";
+const char* ssid = "Rede";
+const char* password = "Senha";
 
 // Intervalos de Operação (ms)
 const uint32_t READ_INTERVAL = 5000;     // 5s = 5000
