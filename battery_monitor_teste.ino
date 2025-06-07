@@ -32,8 +32,8 @@ const uint16_t CRITICAL_LOW = 3200;   // 3.2V (nível crítico)
 const size_t MAX_FILE_SIZE = 512000;  // 512KB (50% da partição)
 
 // Configuração WiFi
-const char* ssid = "NOME_INTERNET";
-const char* password = "SENHA";
+const char* ssid = "Francisca";
+const char* password = "Francisca2909";
 
 // Intervalos de Operação (ms)
 const uint32_t READ_INTERVAL = 5000;     // 5s = 5000
@@ -58,6 +58,10 @@ struct BatteryData {
 Adafruit_ADS1115 ads;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+
+// Variáveis para filtro IIR
+float filteredVoltages[NUM_BATTERIES] = {0};
+const float alpha = 0.1;  // Coeficiente do filtro IIR
 
 // =============== PROTÓTIPOS DE FUNÇÕES ===============
 void initHardware();
@@ -420,48 +424,44 @@ void initWebServer() {
   Serial.println("[WEB] Servidor inicializado na porta 80");
 }
 
-bool readBatteries(BatteryData *data) {
+bool readBatteries(BatteryData* data) {
+  const uint8_t samples = 8; // Número de amostras para oversampling
   data->totalVoltage = 0;
   data->overVoltage = false;
   data->underVoltage = false;
   data->criticalLow = false;
-  uint8_t errorCount = 0;
 
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    int16_t adc = ads.readADC_SingleEnded(i);
-    
-    // Verificação robusta de leitura
-    if (adc == INT16_MAX || adc == INT16_MIN) {
-      errorCount++;
-      continue;
+    long sum = 0;
+
+    for (uint8_t s = 0; s < samples; s++) {
+      sum += ads.readADC_SingleEnded(i);
+      delayMicroseconds(500); // Pequeno delay para estabilizar entre leituras
     }
-    
-    data->voltages[i] = adc * 0.125F; // Conversão para mV (0.125mV por bit)
-    
-    // Verificação de segurança
-    if (data->voltages[i] > OVER_VOLTAGE) {
-      data->overVoltage = true;
-    } else if (data->voltages[i] < MIN_VOLTAGE) {
-      data->underVoltage = true;
-    } else if (data->voltages[i] < CRITICAL_LOW) {
-      data->criticalLow = true;
-    }
-    
-    data->totalVoltage += constrain(data->voltages[i], 0, OVER_VOLTAGE);
+
+    int16_t avgRaw = sum / samples;
+    int16_t voltage = avgRaw * 0.1875; // Conversão para mV (baseado no ganho padrão)
+
+    // Aplicação do filtro IIR
+    filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
+    data->voltages[i] = static_cast<int16_t>(filteredVoltages[i]);
+
+    data->totalVoltage += data->voltages[i];
+
+    if (data->voltages[i] > OVER_VOLTAGE) data->overVoltage = true;
+    if (data->voltages[i] < MIN_VOLTAGE) data->underVoltage = true;
+    if (data->voltages[i] < CRITICAL_LOW) data->criticalLow = true;
   }
 
-  if (errorCount > 0) {
-    Serial.printf("[ADC] %d leitura(s) inválida(s)\n", errorCount);
-    return false;
-  }
   return true;
 }
 
+//A curva que aplicamos aqui aproxima o comportamento real da descarga LiPo, que não é linear:
+//a maior parte da variação de carga ocorre entre 3,7V e 4,0V.
 void calculatePercentages(BatteryData *data) {
   uint16_t sum = 0;
-  
+
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    // Curva de descarga não-linear aproximada para LiPo
     if (data->voltages[i] >= 4100) {
       data->percentages[i] = 90 + map(data->voltages[i], 4100, MAX_VOLTAGE, 0, 10);
     } else if (data->voltages[i] >= 3900) {
@@ -471,13 +471,13 @@ void calculatePercentages(BatteryData *data) {
     } else {
       data->percentages[i] = map(data->voltages[i], MIN_VOLTAGE, 3700, 0, 30);
     }
-    
+
     data->percentages[i] = constrain(data->percentages[i], 0, 100);
     sum += data->percentages[i];
   }
-  
+
   data->totalPercentage = sum / NUM_BATTERIES;
-}
+} 
 
 void handleSafety(BatteryData *data) {
   if (data->overVoltage) {
