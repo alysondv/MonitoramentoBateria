@@ -434,7 +434,7 @@ void initWebServer() {
 }
 
 bool readBatteries(BatteryData* data) {
-  const uint8_t samples = 8; // Número de amostras para oversampling
+  const uint8_t samples = 8; // Oversampling: número de amostras
   float rawSum[NUM_BATTERIES] = {0};
   float avgVoltages[NUM_BATTERIES] = {0};
 
@@ -448,26 +448,22 @@ bool readBatteries(BatteryData* data) {
     for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
       int16_t raw = ads.readADC_SingleEnded(i);
       rawSum[i] += raw;
-      delayMicroseconds(500); // Pequeno delay entre amostras (opcional)
+      delayMicroseconds(500); // Delay opcional para estabilidade
     }
   }
 
+  // Conversão e aplicação do filtro IIR
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
     float avgRaw = rawSum[i] / samples;
-    float corrected = avgRaw * adcStep * correctionFactors[i];
+    float voltage = avgRaw * adcStep * correctionFactors[i];
 
-    // Filtro IIR aplicado após oversampling
-    filteredVoltages[i] = alpha * corrected + (1 - alpha) * filteredVoltages[i];
+    filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
     avgVoltages[i] = filteredVoltages[i];
+
+    data->voltages[i] = static_cast<int16_t>(avgVoltages[i]);
   }
 
-  // Cálculo das tensões diferenciais por célula
-  data->voltages[0] = static_cast<int16_t>(avgVoltages[0]);
-  data->voltages[1] = static_cast<int16_t>(avgVoltages[1] - avgVoltages[0]);
-  data->voltages[2] = static_cast<int16_t>(avgVoltages[2] - avgVoltages[1]);
-  data->voltages[3] = static_cast<int16_t>(avgVoltages[3] - avgVoltages[2]);
-
-  // Análise de segurança
+  // Análise de segurança e soma da tensão total
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
     data->totalVoltage += data->voltages[i];
 
@@ -478,6 +474,7 @@ bool readBatteries(BatteryData* data) {
 
   return true;
 }
+
 
 
 //A curva que aplicamos aqui aproxima o comportamento real da descarga LiPo, que não é linear:
