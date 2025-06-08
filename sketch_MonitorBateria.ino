@@ -1,85 +1,100 @@
 /*
- * BatteryMonitorMinimal – RAW + kDiv
- * =========================================
- * Objetivo desta versão: depurar divisores.
- *  – Lê os 4 canais single‑ended do ADS1115.
- *  – Imprime: ms,raw0,raw1,raw2,raw3,mV0,mV1,mV2,mV3
- *    onde mVx = raw × 0,1875 mV/bit × kDiv[x].
- *  – Não aplica kGain nem offsets, nem calcula tensões diferenciais.
+ * BatteryMonitorMinimal – OVERSAMPLING v1
+ * ======================================
+ * Lê os quatro canais single‑ended do ADS1115, aplica
+ * oversampling de N leituras e converte em mV via kDiv.
+ * Imprime CSV:
+ *   ms,raw0,raw1,raw2,raw3,mV0,mV1,mV2,mV3
  *
- * Configurado para ADS1115 em PGA ±6,144 V (0,1875 mV/bit).
- * Serial: 115 200 baud.
+ * Mudanças desta versão:
+ *   • PGA continua ±6,144 V (GAIN_TWOTHIRDS) → 0,1875 mV/bit.
+ *   • Data‑rate fixada em 475 SPS (melhor relação ruído/tempo).
+ *   • Oversampling (média) de 16 amostras por canal → desvio‑padrão ≈¼.
+ *   • kDiv calibrados empiricamente (08‑Jun‑2025).
+ *
+ * 08‑Jun‑2025.
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 
-// ─── Hardware / I²C ──────────────────────────────────────────
+// ─── Hardware / I2C ───
 constexpr uint8_t I2C_SDA = 42;
 constexpr uint8_t I2C_SCL = 41;
 constexpr uint8_t ADS_ADDR = 0x48;
 
-// ─── Temporização ───────────────────────────────────────────
-constexpr uint16_t SAMPLE_INTERVAL_MS = 500; // 2 Hz
+// ─── Temporização ───
+constexpr uint16_t SAMPLE_PERIOD_MS = 500; // logger a 2 Hz
+constexpr uint8_t  N_OVERSAMPLE     = 16;  // 16 médias → 34 ms/ch aprox.
 
-// ─── ADS1115 Constantes ────────────────────────────────────
+// ─── ADS1115 constantes ───
 constexpr size_t NUM_CH = 4;
-constexpr float  LSB_MV   = 0.1875f;          // mV/bit @ PGA ±6,144 V
+constexpr float  LSB_MV  = 0.1875f;        // mV/bit @ PGA ±6,144 V
 
-// ─── Divisores resistivos (valores MEDIDOS) ────────────────
+// ─── Divisores efetivos ───
 float kDiv[NUM_CH] = {
-  1.042f,  // A0 – Célula 1 (efetivo)
+  1.042f,  // A0 – C1
   2.109f,  // A1 – C1+C2
   3.023f,  // A2 – C1+C2+C3
-  4.033f   // A3 – Pack total
+  4.033f   // A3 – Pack
 };
 
-// ─── Globais ───────────────────────────────────────────────
+// ─── Globais ───
 Adafruit_ADS1115 ads;
 uint32_t nextSample = 0;
 uint32_t lineCnt    = 0;
 
-// ─── Setup ─────────────────────────────────────────────────
+// ─── Prototipagem ───
+int16_t readAveraged(uint8_t ch);
+
+// ─── Setup ───
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
 
   if (!ads.begin(ADS_ADDR)) {
-    Serial.println(F("[ADS] Falha ao inicializar – verifique conexões!"));
+    Serial.println(F("[ADS] Falha ao inicializar – confira fiação!"));
     while (true) delay(1000);
   }
-  ads.setGain(GAIN_TWOTHIRDS); // ±6,144 V
+
+  ads.setGain(GAIN_TWOTHIRDS);               // ±6,144 V → 0,1875 mV/bit
+  ads.setDataRate(RATE_ADS1115_475SPS);      // taxa com melhor SNR/time
 
   Serial.println(F("ms,raw0,raw1,raw2,raw3,mV0,mV1,mV2,mV3"));
 }
 
-// ─── Loop ──────────────────────────────────────────────────
+// ─── Função de oversampling ───
+int16_t readAveraged(uint8_t ch)
+{
+  int32_t acc = 0;
+  for (uint8_t i = 0; i < N_OVERSAMPLE; ++i) {
+    acc += ads.readADC_SingleEnded(ch);
+  }
+  return static_cast<int16_t>(acc / N_OVERSAMPLE);
+}
+
+// ─── Loop ───
 void loop() {
   const uint32_t now = millis();
   if (now < nextSample) return;
-  nextSample = now + SAMPLE_INTERVAL_MS;
+  nextSample = now + SAMPLE_PERIOD_MS;
 
-  // 1. Leitura bruta
   int16_t raw[NUM_CH];
+  float   mv [NUM_CH];
+
+  // Amostragem + conversão
   for (uint8_t i = 0; i < NUM_CH; ++i) {
-    raw[i] = ads.readADC_SingleEnded(i);
+    raw[i] = readAveraged(i);
+    mv[i]  = raw[i] * LSB_MV * kDiv[i];
   }
 
-  // 2. Conversão com kDiv
-  float mv[NUM_CH];
-  for (uint8_t i = 0; i < NUM_CH; ++i) {
-    mv[i] = raw[i] * LSB_MV * kDiv[i];
-  }
-
-  // 3. Cabeçalho periódico para log longo
+  // Cabeçalho periódico
   if (++lineCnt % 50 == 1) {
     Serial.println(F("ms,raw0,raw1,raw2,raw3,mV0,mV1,mV2,mV3"));
   }
 
-  // 4. Impressão CSV
   Serial.printf("%lu,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f\n",
-               now,
-               raw[0], raw[1], raw[2], raw[3],
+               now, raw[0], raw[1], raw[2], raw[3],
                mv[0], mv[1], mv[2], mv[3]);
 }
