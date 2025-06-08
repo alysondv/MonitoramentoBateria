@@ -1,95 +1,66 @@
 /*
- * BatteryMonitorMinimal – OVERSAMPLING + CÉLULAS + NTP v3
- * =======================================================
- * – Oversampling de 16 leituras @ 475 SPS.
- * – Converte acumulados em tensões individuais (C1…C4).
- * – Timestamp em tempo‑real HH:MM:SS via NTP.
- * – CSV limpo: HH:MM:SS,C1_mV,C2_mV,C3_mV,C4_mV,Total_mV
+ * BatteryMonitor – Web + WS v4.1 (startup quick‑fix)
+ * =================================================
+ * – Desativa o task‑watchdog (“task_wdt”) que poluía o Serial.
+ * – Limita a tentativa de Wi‑Fi a 5 s; se falhar, segue offline.
+ */
+ * =============================================
+ * • Oversampling (16× @ 475 SPS) -> C1…C4 + Total
+ * • Timestamp HH:MM:SS via NTP (UTC‑3, BR)
+ * • Servidor HTTP (porta 80) + WebSocket "/ws"
+ * • Página única SPA em / (carregada de SPIFFS)
+ * • WS envia JSON: {"t":"HH:MM:SS","v":[C1,C2,C3,C4],"tot":Total}
  *
- * 08‑Jun‑2025.
+ * 08‑Jun‑2025
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
 #include <Adafruit_ADS1X15.h>
-#include <time.h>
 
-// ─── Hardware / I²C ───
+// ─── Credenciais Wi‑Fi ───
+const char* SSID     = "Mocoto";
+const char* PASSWORD = "gleja23#";
+
+// ─── NTP ───
+const char* NTP_SERVER      = "pool.ntp.org";
+constexpr long  UTC_OFFSET  = -3 * 3600;  // Brasil‑São Paulo (UTC‑3)
+constexpr long  DST_OFFSET  = 0;
+
+// ─── I²C / ADS1115 ───
 constexpr uint8_t I2C_SDA = 42;
 constexpr uint8_t I2C_SCL = 41;
-constexpr uint8_t ADS_ADDR = 0x48;
-
-// ─── Oversampling ───
-constexpr uint8_t  N_OVERSAMPLE    = 16;
-constexpr uint16_t LOOP_INTERVAL_MS = 500;  // taxa de log ~2 Hz
-
-// ─── ADS1115 constantes ───
-constexpr size_t NUM_CH = 4;
-constexpr float  LSB_MV  = 0.1875f;          // mV/bit @ PGA ±6,144 V
-
-// ─── Divisores calibrados (08‑Jun‑2025) ───
-float kDiv[NUM_CH] = {
-  1.042f,  // A0 – C1
-  2.109f,  // A1 – C1+C2
-  3.023f,  // A2 – C1+C2+C3
-  4.033f   // A3 – Pack
-};
-
-// ─── Wi‑Fi + NTP ───
-const char* WIFI_SSID = "Mocoto";
-const char* WIFI_PASS = "gleja23#";
-const char* NTP_SERVER = "pool.ntp.org";
-constexpr long  GMT_OFFSET  = -3 * 3600; // Brasil (‑03:00)
-constexpr int   DST_OFFSET  = 0;
-
-// ─── Globais ───
 Adafruit_ADS1115 ads;
-uint32_t nextLoop = 0;
 
-// ─────────────────────────────────────────────────────────────
-// Funções auxiliares
-// ─────────────────────────────────────────────────────────────
+constexpr size_t NUM_CH     = 4;
+constexpr uint8_t N_SAMPLE  = 16;       // oversampling
+constexpr float  LSB_MV     = 0.1875f;  // PGA ±6,144 V
+float kDiv[NUM_CH] = {1.042f, 2.109f, 3.023f, 4.033f};
 
-int16_t readAveraged(uint8_t ch)
-{
-  int32_t acc = 0;
-  for (uint8_t i = 0; i < N_OVERSAMPLE; ++i)
-    acc += ads.readADC_SingleEnded(ch);
-  return acc / N_OVERSAMPLE;
-}
+// ─── Web ───
+AsyncWebServer    server(80);
+AsyncWebSocket    ws("/ws");
 
+// ─── Tempo ───
 String getTimestamp()
 {
-  time_t now = time(nullptr);
-  if (now < 8 * 3600) {          // tempo não sincronizado
-    // fallback para millis /1000
-    uint32_t s = millis() / 1000;
-    char buf[9];
-    snprintf(buf, sizeof(buf), "%02u:%02u:%02u", (s/3600)%24, (s/60)%60, s%60);
-    return String(buf);
-  }
-  struct tm tminfo;
-  localtime_r(&now, &tminfo);
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00:00:00";
   char buf[9];
-  strftime(buf, sizeof(buf), "%H:%M:%S", &tminfo);
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
   return String(buf);
 }
 
-void connectWiFi()
-{
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(250);
-  }
-}
-
-void setupNTP()
-{
-  configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
-}
+// ─── Func protótipos ───
+int16_t readAvg(uint8_t ch);
+void   sendWS(float cell[NUM_CH], float total);
+bool   initWiFi();
+void   initSPIFFS();
+void   initWeb();
 
 // ─── Setup ───
 void setup()
@@ -97,46 +68,126 @@ void setup()
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  if (!ads.begin(ADS_ADDR)) {
-    Serial.println(F("[ADS] Falha ao inicializar"));
+  if (!ads.begin(0x48)) {
+    Serial.println("ADS1115 não encontrado");
     while (true) delay(1000);
   }
-  ads.setGain(GAIN_TWOTHIRDS);              // ±6,144 V
+  ads.setGain(GAIN_TWOTHIRDS);
   ads.setDataRate(RATE_ADS1115_475SPS);
 
-  connectWiFi();     // tenta Wi‑Fi (15 s máx.)
-  setupNTP();        // dispara sincronização
+  initSPIFFS();
+  initWiFi();
+  configTime(UTC_OFFSET, DST_OFFSET, NTP_SERVER);
+  initWeb();
 
-  Serial.println(F("HH:MM:SS,C1_mV,C2_mV,C3_mV,C4_mV,Total_mV"));
+  Serial.println("Sistema pronto");
 }
 
 // ─── Loop ───
 void loop()
 {
-  const uint32_t nowMs = millis();
-  if (nowMs < nextLoop) return;
-  nextLoop = nowMs + LOOP_INTERVAL_MS;
+  static uint32_t nextMs = 0;
+  uint32_t now = millis();
+  if (now < nextMs) { ws.cleanupClients(); return; }
+  nextMs = now + 500; // 2 Hz
 
-  // 1. Amostras e conversão para acumulados
   int16_t raw[NUM_CH];
   float   vAbs[NUM_CH];
   for (uint8_t i = 0; i < NUM_CH; ++i) {
-    raw[i]  = readAveraged(i);
+    raw[i]  = readAvg(i);
     vAbs[i] = raw[i] * LSB_MV * kDiv[i];
   }
-
-  // 2. Tensões individuais
   float cell[NUM_CH];
   cell[0] = vAbs[0];
   cell[1] = vAbs[1] - vAbs[0];
   cell[2] = vAbs[2] - vAbs[1];
   cell[3] = vAbs[3] - vAbs[2];
-  float pack = vAbs[3];
+  float total = vAbs[3];
 
-  // 3. Timestamp
-  String stamp = getTimestamp();
+  // Serial CSV
+  Serial.printf("%s,%.0f,%.0f,%.0f,%.0f,%.0f\n", getTimestamp().c_str(),
+               cell[0], cell[1], cell[2], cell[3], total);
 
-  // 4. CSV
-  Serial.printf("%s,%.0f,%.0f,%.0f,%.0f,%.0f\n",
-               stamp.c_str(), cell[0], cell[1], cell[2], cell[3], pack);
+  sendWS(cell, total);
+  ws.cleanupClients();
+}
+
+// ─── Funções ───
+int16_t readAvg(uint8_t ch)
+{
+  int32_t acc = 0;
+  for (uint8_t i = 0; i < N_SAMPLE; ++i) acc += ads.readADC_SingleEnded(ch);
+  return acc / N_SAMPLE;
+}
+
+void sendWS(float cell[NUM_CH], float total)
+{
+  if (ws.count() == 0) return;
+  String json = "{\"t\":\"" + getTimestamp() + "\",\"v\":";
+  json += "[" + String((int)cell[0]);
+  for (uint8_t i = 1; i < NUM_CH; ++i) json += "," + String((int)cell[i]);
+  json += "],\"tot\":" + String((int)total) + "}";
+  ws.textAll(json);
+}
+
+// ─── Wi‑Fi ───
+bool initWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASSWORD);
+  Serial.print("Conectando‑se ao Wi‑Fi");
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500); Serial.print('.');
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(" falhou");
+    return false;
+  }
+  Serial.print("\nIP: "); Serial.println(WiFi.localIP());
+  return true;
+}
+
+// ─── SPIFFS & Web ───
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>LiPo Monitor</title>
+<style>
+ body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:480px;padding:1rem}
+ #cells{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;margin-top:1rem}
+ .card{border:1px solid #888;border-radius:8px;padding:0.5rem}
+ .v{font-size:1.4rem;font-weight:700}
+</style></head><body>
+<h3>LiPo 4 S Monitor</h3><div id='t'>--:--:--</div>
+<div id='cells'></div><script>
+let ws;
+function connect(){ws=new WebSocket('ws://'+location.host+'/ws');
+ ws.onopen=()=>console.log('ws ok');
+ ws.onmessage=e=>{const d=JSON.parse(e.data);document.getElementById('t').textContent=d.t;
+ const arr=d.v;let html='';arr.forEach((v,i)=>{html+=`<div class='card'>C${i+1}<div class='v'>${(v/1000).toFixed(3)} V</div></div>`});
+ html+=`<div class='card' style='grid-column:span 2'>Total<div class='v'>${(d.tot/1000).toFixed(3)} V</div></div>`;
+ document.getElementById('cells').innerHTML=html;};
+ ws.onclose=()=>setTimeout(connect,2000);}
+connect();
+</script></body></html>
+)rawliteral";
+
+void initSPIFFS()
+{
+  if (!SPIFFS.begin(true)) { Serial.println("SPIFFS erro"); while(true) delay(1000);}  
+  if (!SPIFFS.exists("/index.html")) {
+    File f = SPIFFS.open("/index.html", FILE_WRITE);
+    if (f) { f.print(INDEX_HTML); f.close(); }
+  }
+}
+
+void initWeb()
+{
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(SPIFFS, "/index.html", "text/html");
+  });
+  ws.onEvent([](AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType, void*, uint8_t*, size_t){});
+  server.addHandler(&ws);
+  server.begin();
 }
