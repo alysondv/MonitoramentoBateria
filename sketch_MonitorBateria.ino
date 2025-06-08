@@ -3,7 +3,6 @@
  * =================================================
  * – Desativa o task‑watchdog (“task_wdt”) que poluía o Serial.
  * – Limita a tentativa de Wi‑Fi a 5 s; se falhar, segue offline.
- */
  * =============================================
  * • Oversampling (16× @ 475 SPS) -> C1…C4 + Total
  * • Timestamp HH:MM:SS via NTP (UTC‑3, BR)
