@@ -434,34 +434,50 @@ void initWebServer() {
 }
 
 bool readBatteries(BatteryData* data) {
-  const uint8_t samples = 8; // Oversampling: número de amostras
+  const uint8_t samples = 8;
   float rawSum[NUM_BATTERIES] = {0};
-  float avgVoltages[NUM_BATTERIES] = {0};
+  float corrected[NUM_BATTERIES] = {0};
+  float individual[NUM_BATTERIES] = {0};
 
   data->totalVoltage = 0;
   data->overVoltage = false;
   data->underVoltage = false;
   data->criticalLow = false;
 
-  // Oversampling: média de múltiplas leituras
+  // Oversampling
   for (uint8_t s = 0; s < samples; s++) {
     for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
       int16_t raw = ads.readADC_SingleEnded(i);
       rawSum[i] += raw;
-      delayMicroseconds(500); // Delay opcional para estabilidade
+      delayMicroseconds(300);
     }
   }
 
-  // Conversão e aplicação do filtro IIR
+  // Conversão para tensão real acumulada
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
     float avgRaw = rawSum[i] / samples;
-    float voltage = avgRaw * adcStep * correctionFactors[i];
-
-    filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
-    avgVoltages[i] = filteredVoltages[i];
-
-    data->voltages[i] = static_cast<int16_t>(avgVoltages[i]);
+    corrected[i] = avgRaw * adcStep * correctionFactors[i]; // em mV
   }
+
+  // Cálculo de tensões por célula (diferenciais)
+  individual[0] = corrected[0];                  // Célula 1 (direta)
+  individual[1] = corrected[1] - corrected[0];   // Célula 2
+  individual[2] = corrected[2] - corrected[1];   // Célula 3
+  individual[3] = corrected[3] - corrected[2];   // Célula 4
+
+  // Filtro e armazenamento
+  for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
+    filteredVoltages[i] = alpha * individual[i] + (1 - alpha) * filteredVoltages[i];
+    data->voltages[i] = static_cast<int16_t>(filteredVoltages[i]);
+    data->totalVoltage += data->voltages[i];
+
+    if (data->voltages[i] > OVER_VOLTAGE) data->overVoltage = true;
+    if (data->voltages[i] < MIN_VOLTAGE) data->underVoltage = true;
+    if (data->voltages[i] < CRITICAL_LOW) data->criticalLow = true;
+  }
+
+  return true;
+}
 
   // Análise de segurança e soma da tensão total
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
