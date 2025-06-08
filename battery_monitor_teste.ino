@@ -66,10 +66,10 @@ const float alpha = 0.1;  // Coeficiente do filtro IIR
 // Fator de correção de cada célula
 const float adcStep = 0.125; // mV por bit (GAIN_ONE)
 const float correctionFactors[NUM_BATTERIES] = {
-  1.0f,         // C1 (sem divisor)
-  2.0f,         // C2 (1k:1k)
-  1.0f / 0.319, // C3 (4700:2200)
-  1.0f / 0.244  // C4 (6800:2200)
+  1.0f,        // C1: sem divisor
+  2.0f,        // C2: 1k : 1k
+  3.134f,      // C3: 4700 : 2200
+  4.098f       // C4: 6800 : 2200
 };
 
 // =============== PROTÓTIPOS DE FUNÇÕES ===============
