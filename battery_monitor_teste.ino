@@ -425,80 +425,70 @@ void initWebServer() {
 }
 
 bool readBatteries(BatteryData* data) {
-  // Constantes de calibração conforme dados fornecidos
-  constexpr float LSB_MV = 0.1875f;        // PGA ±6,144 V (GAIN_TWOTHIRDS)
-  const float kDiv[4] = {1.042f, 2.109f, 3.023f, 4.033f}; // Fatores de divisão por canal
+  // Limpar dados anteriores
+  memset(data, 0, sizeof(BatteryData));
   
-  // Variáveis para armazenar leituras brutas e tensões calculadas
-  int16_t adcReadings[NUM_BATTERIES];
-  float cellVoltages[NUM_BATTERIES + 1] = {0}; // +1 para armazenar a tensão total
-  
-  // 1. Leitura dos canais do ADS1115
-  for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    adcReadings[i] = ads.readADC_SingleEnded(i);
-    
-    // Aplica filtro IIR para suavizar as leituras
-    static bool firstRead = true;
-    if (firstRead) {
-      filteredVoltages[i] = adcReadings[i] * LSB_MV * kDiv[i];
-      firstRead = false;
-    } else {
-      filteredVoltages[i] = alpha * (adcReadings[i] * LSB_MV * kDiv[i]) + 
-                           (1 - alpha) * filteredVoltages[i];
-    }
-    
-    // Converte para mV e armazena a tensão acumulada filtrada
-    cellVoltages[i] = filteredVoltages[i];
+  // Configurações do ADS1115 (como no código 2)
+  static bool firstRun = true;
+  if (firstRun) {
+    ads.setGain(GAIN_TWOTHIRDS);  // ±6.144V (igual ao código 2)
+    ads.setDataRate(RATE_ADS1115_475SPS);
+    firstRun = false;
   }
+
+  // Fatores de divisão calibrados (como no código 2)
+  const float kDiv[NUM_BATTERIES] = {1.042f, 2.109f, 3.023f, 4.033f};
+  const float LSB_MV = 0.1875f;  // mV/bit @ PGA ±6.144V
   
-  // 2. Cálculo das tensões individuais das células
-  data->voltages[0] = static_cast<int16_t>(cellVoltages[0]); // Célula 1 = A0
-  data->voltages[1] = static_cast<int16_t>(cellVoltages[1] - cellVoltages[0]); // Célula 2 = A1 - A0
-  data->voltages[2] = static_cast<int16_t>(cellVoltages[2] - cellVoltages[1]); // Célula 3 = A2 - A1
-  data->voltages[3] = static_cast<int16_t>(cellVoltages[3] - cellVoltages[2]); // Célula 4 = A3 - A2
-  
-  // 3. Cálculo da tensão total do pack
-  data->totalVoltage = static_cast<int16_t>(cellVoltages[3]);
-  
-  // 4. Verificação de segurança
-  data->overVoltage = false;
-  data->underVoltage = false;
-  data->criticalLow = false;
+  // 1. Amostras e conversão para acumulados (oversampling como no código 2)
+  int16_t raw[NUM_BATTERIES];
+  float vAbs[NUM_BATTERIES];
+  bool readSuccess = true;
   
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    // Verifica sobretensão
+    // Oversampling de 16 leituras (como no código 2)
+    int32_t acc = 0;
+    for (uint8_t j = 0; j < 16; j++) {
+      int16_t value = ads.readADC_SingleEnded(i);
+      if (value == 0x7FFF) { // Valor de erro do ADS1115
+        Serial.printf("[LEITURA] Erro na célula %d\n", i+1);
+        readSuccess = false;
+      }
+      acc += value;
+    }
+    raw[i] = acc / 16;
+    vAbs[i] = raw[i] * LSB_MV * kDiv[i];
+  }
+
+  if (!readSuccess) {
+    return false;
+  }
+
+  // 2. Calcular tensões individuais (método do código 2)
+  float cellVoltages[NUM_BATTERIES];
+  cellVoltages[0] = vAbs[0];  // Célula 1
+  cellVoltages[1] = vAbs[1] - vAbs[0];  // Célula 2
+  cellVoltages[2] = vAbs[2] - vAbs[1];  // Célula 3
+  cellVoltages[3] = vAbs[3] - vAbs[2];  // Célula 4
+  float packVoltage = vAbs[3];  // Tensão total
+
+  // Converter para inteiros (mV) e armazenar nos dados
+  for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
+    data->voltages[i] = static_cast<int16_t>(cellVoltages[i]);
+    
+    // Verificar condições de segurança
     if (data->voltages[i] > OVER_VOLTAGE) {
       data->overVoltage = true;
-    }
-    // Verifica subtensão
-    if (data->voltages[i] < MIN_VOLTAGE) {
+    } else if (data->voltages[i] < MIN_VOLTAGE) {
       data->underVoltage = true;
-    }
-    // Verifica nível crítico
-    if (data->voltages[i] < CRITICAL_LOW) {
+    } else if (data->voltages[i] < CRITICAL_LOW) {
       data->criticalLow = true;
     }
   }
   
-  // 5. Validação das leituras
-  bool valid = true;
-  for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    // Verifica se as leituras estão dentro de limites físicos razoáveis
-    if (data->voltages[i] < 2000 || data->voltages[i] > 4500) {
-      valid = false;
-      Serial.printf("[ERRO] Leitura inválida na célula %d: %dmV\n", i+1, data->voltages[i]);
-    }
-    
-    // Verifica consistência entre as células (diferença máxima de 500mV)
-    for (uint8_t j = i+1; j < NUM_BATTERIES; j++) {
-      if (abs(data->voltages[i] - data->voltages[j]) > 500) {
-        Serial.printf("[AVISO] Grande diferença entre células %d e %d: %dmV\n", 
-                     i+1, j+1, abs(data->voltages[i] - data->voltages[j]));
-      }
-    }
-  }
-  
-  return valid;
+  data->totalVoltage = static_cast<int16_t>(packVoltage);
+
+  return true;
 }
 
 //A curva que aplicamos aqui aproxima o comportamento real da descarga LiPo, que não é linear:
