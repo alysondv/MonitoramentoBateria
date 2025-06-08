@@ -32,11 +32,11 @@ const uint16_t CRITICAL_LOW = 3200;   // 3.2V (nível crítico)
 const size_t MAX_FILE_SIZE = 512000;  // 512KB (50% da partição)
 
 // Configuração WiFi
-const char* ssid = "Rede";
-const char* password = "Senha";
+const char* ssid = "Mocoto";
+const char* password = "gleja23#";
 
 // Intervalos de Operação (ms)
-const uint32_t READ_INTERVAL = 5000;     // 5s = 5000
+const uint32_t READ_INTERVAL = 10000;     // 5s = 5000
 const uint32_t SAVE_INTERVAL = 300000;   // 5min
 const uint32_t RECONNECT_INTERVAL = 30000;
 const uint32_t SYSTEM_CHECK_INTERVAL = 3600000; // 1h
@@ -62,6 +62,15 @@ AsyncWebSocket ws("/ws");
 // Variáveis para filtro IIR
 float filteredVoltages[NUM_BATTERIES] = {0};
 const float alpha = 0.1;  // Coeficiente do filtro IIR
+
+// Fator de correção de cada célula
+const float adcStep = 0.125; // mV por bit (GAIN_ONE)
+const float correctionFactors[NUM_BATTERIES] = {
+  1.0f,         // C1 (sem divisor)
+  2.0f,         // C2 (1k:1k)
+  1.0f / 0.319, // C3 (4700:2200)
+  1.0f / 0.244  // C4 (6800:2200)
+};
 
 // =============== PROTÓTIPOS DE FUNÇÕES ===============
 void initHardware();
@@ -426,30 +435,40 @@ void initWebServer() {
 
 bool readBatteries(BatteryData* data) {
   const uint8_t samples = 8; // Número de amostras para oversampling
+  float rawSum[NUM_BATTERIES] = {0};
+  float avgVoltages[NUM_BATTERIES] = {0};
+
   data->totalVoltage = 0;
   data->overVoltage = false;
   data->underVoltage = false;
   data->criticalLow = false;
 
+  // Oversampling: média de múltiplas leituras
+  for (uint8_t s = 0; s < samples; s++) {
+    for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
+      int16_t raw = ads.readADC_SingleEnded(i);
+      rawSum[i] += raw;
+      delayMicroseconds(500); // Pequeno delay entre amostras (opcional)
+    }
+  }
+
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    long sum = 0;
+    float avgRaw = rawSum[i] / samples;
+    float corrected = avgRaw * adcStep * correctionFactors[i];
 
-    for (uint8_t s = 0; s < samples; s++) {
-      sum += ads.readADC_SingleEnded(i);
-      delayMicroseconds(500);
-    }
+    // Filtro IIR aplicado após oversampling
+    filteredVoltages[i] = alpha * corrected + (1 - alpha) * filteredVoltages[i];
+    avgVoltages[i] = filteredVoltages[i];
+  }
 
-    int16_t avgRaw = sum / samples;
-    int16_t voltage = avgRaw * 0.1875;
+  // Cálculo das tensões diferenciais por célula
+  data->voltages[0] = static_cast<int16_t>(avgVoltages[0]);
+  data->voltages[1] = static_cast<int16_t>(avgVoltages[1] - avgVoltages[0]);
+  data->voltages[2] = static_cast<int16_t>(avgVoltages[2] - avgVoltages[1]);
+  data->voltages[3] = static_cast<int16_t>(avgVoltages[3] - avgVoltages[2]);
 
-    // Corrigir acúmulo infinito: inicializa o filtro com a 1ª leitura válida
-    if (filteredVoltages[i] == 0) {
-      filteredVoltages[i] = voltage;
-    } else {
-      filteredVoltages[i] = alpha * voltage + (1 - alpha) * filteredVoltages[i];
-    }
-
-    data->voltages[i] = static_cast<int16_t>(filteredVoltages[i]);
+  // Análise de segurança
+  for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
     data->totalVoltage += data->voltages[i];
 
     if (data->voltages[i] > OVER_VOLTAGE) data->overVoltage = true;
@@ -476,11 +495,9 @@ void calculatePercentages(BatteryData *data) {
     } else {
       data->percentages[i] = map(data->voltages[i], MIN_VOLTAGE, 3700, 0, 30);
     }
-
     data->percentages[i] = constrain(data->percentages[i], 0, 100);
     sum += data->percentages[i];
   }
-
   data->totalPercentage = sum / NUM_BATTERIES;
 } 
 
