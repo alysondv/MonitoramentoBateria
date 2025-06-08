@@ -63,15 +63,6 @@ AsyncWebSocket ws("/ws");
 float filteredVoltages[NUM_BATTERIES] = {0};
 const float alpha = 0.1;  // Coeficiente do filtro IIR
 
-// Fator de correção de cada célula
-const float adcStep = 0.125; // mV por bit (GAIN_ONE)
-const float correctionFactors[NUM_BATTERIES] = {
-  1.0f,        // C1: sem divisor
-  2.0f,        // C2: 1k : 1k
-  3.134f,      // C3: 4700 : 2200
-  4.098f       // C4: 6800 : 2200
-};
-
 // =============== PROTÓTIPOS DE FUNÇÕES ===============
 void initHardware();
 bool initWiFi();
@@ -434,12 +425,12 @@ void initWebServer() {
 }
 
 bool readBatteries(BatteryData* data) {
-  const float adcStep = 0.125f; // mV por bit (GAIN_ONE)
+  const float adcStep = 0.125f; // mV por bit (GAIN_ONE ±4.096V)
   const float kDiv[NUM_BATTERIES] = {
     1.000f,  // Célula 1 – sem divisor
-    2.000f,  // Célula 2 – 989 Ω / 989 Ω
-    3.154f,  // Célula 3 – 4660 Ω / 2164 Ω
-    4.156f   // Célula 4 – 6810 Ω / 2157 Ω
+    2.000f,  // Célula 2 – 989Ω / 989Ω
+    3.154f,  // Célula 3 – 4660Ω / 2164Ω
+    4.156f   // Célula 4 – 6810Ω / 2157Ω
   };
 
   data->totalVoltage = 0;
@@ -448,10 +439,16 @@ bool readBatteries(BatteryData* data) {
   data->criticalLow = false;
 
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
-    int16_t raw = ads.readADC_SingleEnded(i);  // Leitura bruta (0–32767)
-    float voltage = raw * adcStep * kDiv[i];   // Correção do divisor (em mV)
-    
-    data->voltages[i] = static_cast<int16_t>(voltage);
+    int16_t raw = ads.readADC_SingleEnded(i);
+
+    // Garantir que está dentro da faixa esperada (0 a 32767)
+    if (raw < 0) raw = 0;
+
+    // Calcular a tensão real em mV (como float)
+    float voltage = raw * adcStep * kDiv[i]; // em mV, ex: 3700.0
+
+    // Armazenar no struct em milivolts como inteiro (safe cast)
+    data->voltages[i] = round(voltage);
     data->totalVoltage += data->voltages[i];
 
     if (data->voltages[i] > OVER_VOLTAGE) data->overVoltage = true;
@@ -461,6 +458,7 @@ bool readBatteries(BatteryData* data) {
 
   return true;
 }
+
 
 //A curva que aplicamos aqui aproxima o comportamento real da descarga LiPo, que não é linear:
 //a maior parte da variação de carga ocorre entre 3,7V e 4,0V.
