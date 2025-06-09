@@ -1,8 +1,8 @@
 #pragma once
-#include <Arduino.h>
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
 #include "ads_driver.h"
+#include "storage.h"
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
-bool NET_init(const char* ssid, const char* pwd);
-void NET_tick(const CellSample &s);   // envia WS a cada chamada
+bool NET_init();
+void NET_tick(const CellSample &s);

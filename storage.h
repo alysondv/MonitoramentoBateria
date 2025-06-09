@@ -1,7 +1,7 @@
 #pragma once
-#include <Arduino.h>
-#include <SPIFFS.h>
 #include "ads_driver.h"
+#include <FS.h>
+#include <SPIFFS.h>
 
-bool  FS_init();
-void  FS_appendCsv(const CellSample &s);
+bool FS_init();
+void FS_appendCsv(const CellSample &s);
