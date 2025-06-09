@@ -17,6 +17,8 @@
 #include <ESPAsyncWebServer.h>
 #include <Adafruit_ADS1X15.h>
 #include <SPIFFS.h>
+#include <time.h>
+#include "esp_sntp.h"
 
 // =============== CONFIGURAÇÕES ===============
 #define NUM_BATTERIES 4
@@ -53,6 +55,12 @@ struct BatteryData {
   bool criticalLow;
 };
 #pragma pack(pop)
+
+// Configuração NTP
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long gmtOffset_sec = -3 * 3600; // Fuso horário -3 (Brasil)
+const int daylightOffset_sec = 0;
 
 // =============== VARIÁVEIS GLOBAIS ===============
 Adafruit_ADS1115 ads;
@@ -277,7 +285,16 @@ void loop() {
   static BatteryData batData;
   static uint32_t lastRead = 0, lastSave = 0, lastReconnect = 0, lastCheck = 0;
   uint32_t currentMillis = millis();
-
+  static bool timeSynced = false;
+  
+  // Verificar sincronização do tempo
+  if (WiFi.status() == WL_CONNECTED && !timeSynced) {
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)){
+      timeSynced = true;
+      Serial.println("[NTP] Tempo sincronizado: " + getFormattedTimestamp());
+    }
+  }
   // Gerenciamento de Conexão WiFi
   if (WiFi.status() != WL_CONNECTED && currentMillis - lastReconnect >= RECONNECT_INTERVAL) {
     if (initWiFi()) {
@@ -360,7 +377,24 @@ bool initWiFi() {
   Serial.println("\n[WIFI] Conectado com sucesso!");
   Serial.print("Endereço IP: ");
   Serial.println(WiFi.localIP());
+
+  // Configura NTP
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+  Serial.println("[NTP] Configurado - Aguardando sincronização...");
+  
   return true;
+}
+
+String getFormattedTimestamp() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("[NTP] Falha ao obter tempo");
+    return String(millis() / 1000); // Fallback
+  }
+  
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
 }
 
 bool initSPIFFS() {
@@ -406,10 +440,12 @@ void initWebServer() {
     request->send(SPIFFS, "/index.html", "text/html");
   });
 
-  // Rota para download dos dados
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (SPIFFS.exists("/data.csv")) {
-      request->send(SPIFFS, "/data.csv", "text/csv", true);
+      request->send(SPIFFS, "/data.csv", "text/csv", false, [](const String& filename){
+        // Callback para modificar os headers
+        return "attachment; filename=\"battery_data.csv\"";
+      });
     } else {
       request->send(404, "text/plain", "Arquivo de dados não encontrado");
     }
@@ -560,7 +596,7 @@ void updateLEDs(const BatteryData *data) {
 
 bool saveData(const BatteryData *data) {
   // Verificação de espaço disponível
-  if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 1024) { // Menos de 1KB livre
+  if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 1024) {
     Serial.println("[ARMAZENAMENTO] Espaço crítico - Rotacionando arquivos...");
     rotateFiles();
   }
@@ -571,8 +607,11 @@ bool saveData(const BatteryData *data) {
     return false;
   }
 
-  // Formato CSV otimizado
-  String record = String(millis());
+  // Obter timestamp formatado
+  String timestamp = getFormattedTimestamp();
+
+  // Formato CSV com timestamp
+  String record = timestamp;
   for (uint8_t i = 0; i < NUM_BATTERIES; i++) {
     record += "," + String(data->voltages[i]);
     record += "," + String(data->percentages[i]);
@@ -588,6 +627,7 @@ bool saveData(const BatteryData *data) {
   }
   
   file.close();
+  Serial.println("[ARMAZENAMENTO] Dados salvos com sucesso: " + timestamp);
   return true;
 }
 
