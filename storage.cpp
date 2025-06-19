@@ -3,46 +3,67 @@
 
 static File logFile;
 
-static void openLog(bool hdr) {
+static bool openLog(bool writeHeader) {
     logFile = SPIFFS.open("/log.csv", FILE_APPEND);
-    if (hdr) {
-        logFile.println("Time,C1,C2,C3,C4,Total");
+    if (!logFile) {
+        Serial.println("[FS] Erro ao abrir/criar /log.csv");
+        return false;
     }
+    // Escreve cabeçalho se o arquivo está vazio
+    if (logFile.size() == 0 && writeHeader) {
+        logFile.println("hora,c1,c2,c3,c4,total");
+        logFile.flush();
+    }
+    return true;
 }
 
-void FS_init() {
-    SPIFFS.begin(true);
-    if (!SPIFFS.exists("/log.csv")) {
-        openLog(true);
-    } else {
-        openLog(false);
+bool FS_init() {
+    // SPIFFS já deve estar montado no setup()
+    if (!openLog(true)) {
+        Serial.println("[FS] Arquivo de log não disponível");
+        return false;
     }
+    Serial.println("[FS] Log pronto para uso");
+    return true;
 }
 
-void FS_appendCsv(const CellSample &s) {
-    if (!logFile) return;
-
-    // Rotate log file when size exceeds 512KB
+bool FS_appendCsv(const CellSample &s) {
+    if (!logFile) {
+        Serial.println("[FS] Log não aberto, tentando reabrir...");
+        if (!openLog(false)) return false;
+    }
+    // Rotaciona log se necessário
     if (logFile.size() > 512000) {
         logFile.close();
-        SPIFFS.remove("/log_old.csv");
+        if (SPIFFS.exists("/log_old.csv")) SPIFFS.remove("/log_old.csv");
         SPIFFS.rename("/log.csv", "/log_old.csv");
-        openLog(true);
+        if (!openLog(true)) return false;
     }
-
-    // Get local time (UTC-3)
+    // Escreve linha de dados
     time_t now = time(nullptr);
+    if (now < 1600000000) {
+        Serial.println("[FS] Tempo do sistema inválido");
+        return false;
+    }
     struct tm tm;
     localtime_r(&now, &tm);
-
-    logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u\n",
+    size_t bytesWritten = logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u\n",
         tm.tm_hour, tm.tm_min, tm.tm_sec,
         s.mv[0], s.mv[1], s.mv[2], s.mv[3], s.total);
     logFile.flush();
+    if (bytesWritten == 0) {
+        Serial.println("[FS] Erro ao escrever no log");
+        return false;
+    }
+    return true;
 }
 
-void FS_clearLogs() {
-    logFile.close();
-    SPIFFS.remove("/log.csv");
-    openLog(true);
+bool FS_clearLogs() {
+    if (logFile) logFile.close();
+    if (SPIFFS.remove("/log.csv")) {
+        Serial.println("[FS] Log apagado");
+        return openLog(true);
+    }
+    Serial.println("[FS] Falha ao apagar log");
+    return false;
 }

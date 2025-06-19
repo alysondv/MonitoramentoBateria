@@ -98,8 +98,21 @@ static void putIndex(){ File f=SPIFFS.open("/index.html","w"); f.print(index_htm
 void NET_init(){
     if(!SPIFFS.exists("/index.html")) putIndex(); else { SPIFFS.remove("/index.html"); putIndex(); }
 
-    WiFi.mode(WIFI_STA); WiFi.begin(SSID,PASS);
-    uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(SSID, PASS);
+    uint32_t t0 = millis();
+    bool wifiOk = false;
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 3000) delay(100); // Aguarda só 3 segundos
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiOk = true;
+        Serial.printf("[NET] Conectado ao WiFi: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("[NET] WiFi não conectado, ativando modo AP...");
+        WiFi.disconnect();
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP("BatteryMonitor_Config", "12345678");
+        Serial.printf("[NET] AP ativo – acesse: http://%s\n", WiFi.softAPIP().toString().c_str());
+    }
 
     configTime(TZ_OFFSET,0,"pool.ntp.org");
     struct tm tmcheck; time_t now; uint32_t ntpTimeout=millis();
@@ -107,13 +120,9 @@ void NET_init(){
 
     server.on("/",HTTP_GET,[](auto *r){ r->send(SPIFFS,"/index.html","text/html");});
     server.on("/download",HTTP_GET,[](auto *r){ r->send(SPIFFS,"/log.csv","text/csv",true);} );
-
     server.on("/api/raw",HTTP_GET,[](auto *r){ int16_t raw[4]; ADS_raw(raw); StaticJsonDocument<128> d; for(int i=0;i<4;i++) d["raw"][i]=raw[i]; d["lsb"]=0.1875; String o; serializeJson(d,o); r->send(200,"application/json",o);} );
-
     server.on("/api/calibrate",HTTP_POST,[](auto *r){ Calib c; int16_t raw[4]; ADS_raw(raw); StaticJsonDocument<128> d; deserializeJson(d,r->arg("plain")); for(int i=0;i<4;i++){ float v=d["v"][i]; if(v>500) c.kDiv[i]=v/(raw[i]*0.1875);} CFG_save(c); ADS_setKDiv(c.kDiv); r->send(200,"text/plain","OK"); });
-
     server.on("/api/clear_logs",HTTP_POST,[](auto *r){ FS_clearLogs(); r->send(200,"text/plain","CLEARED"); } );
-
     ws.onEvent([](AsyncWebSocket *srv,AsyncWebSocketClient *cli,AwsEventType type,void *arg,uint8_t *data,size_t len){ if(type==WS_EVT_CONNECT) Serial.println("[WS] cliente conectado"); });
     server.addHandler(&ws);
     server.begin();

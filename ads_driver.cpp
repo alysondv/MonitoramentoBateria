@@ -5,46 +5,94 @@ static Adafruit_ADS1115 ads;
 static constexpr uint8_t N = 8;           // Oversampling count
 static constexpr float LSB = 0.1875f;     // mV/bit @ ±6.144V
 static float kDiv[4] = {1.042f, 2.109f, 3.023f, 4.033f};
+static bool isInitialized = false;
 
 void ADS_setKDiv(const float *k) {
-    memcpy(kDiv, k, 4 * sizeof(float));
+    if (k != nullptr) {
+        memcpy(kDiv, k, 4 * sizeof(float));
+    }
 }
 
 static bool readSafe(uint8_t ch, int16_t &val) {
+    if (!isInitialized) {
+        Serial.println("[ADS] ADC não inicializado");
+        return false;
+    }
+    
     for (uint8_t t = 0; t < 3; ++t) {
         val = ads.readADC_SingleEnded(ch);
         if (val != 0xFFFF) return true;
         delay(2);
-        ads.begin(0x48);
+        
+        // Tenta reinicializar o ADS em caso de erro
+        Wire.begin(42, 41, 50000);
+        if (!ads.begin(0x48)) {
+            Serial.println("[ADS] Falha ao reinicializar ADC");
+            continue;
+        }
+        ads.setGain(GAIN_TWOTHIRDS);
     }
+    Serial.printf("[ADS] Falha na leitura do canal %d\n", ch);
     return false;
 }
 
-void ADS_init() {
+bool ADS_init() {
     Wire.begin(42, 41, 50000);    // 50 kHz I2C
-    ads.begin(0x48);
+    
+    if (!ads.begin(0x48)) {
+        Serial.println("[ADS] Falha ao inicializar ADC");
+        isInitialized = false;
+        return false;
+    }
+    
     ads.setGain(GAIN_TWOTHIRDS);  // ±6.144V range
+    isInitialized = true;
+    return true;
 }
 
 bool ADS_getSample(CellSample &out) {
+    if (!isInitialized) {
+        Serial.println("[ADS] ADC não inicializado");
+        return false;
+    }
+
     int32_t acc[4] = {0};
     int16_t raw;
+    uint8_t validSamples = 0;
 
     // Accumulate samples for oversampling
     for (uint8_t i = 0; i < N; i++) {
+        bool sampleValid = true;
         for (uint8_t ch = 0; ch < 4; ch++) {
-            if (!readSafe(ch, raw)) return false;
+            if (!readSafe(ch, raw)) {
+                sampleValid = false;
+                break;
+            }
             acc[ch] += raw;
         }
+        if (sampleValid) validSamples++;
         delayMicroseconds(125);
+    }
+
+    if (validSamples < N/2) {
+        Serial.printf("[ADS] Muitas amostras inválidas: %d/%d\n", validSamples, N);
+        return false;
     }
 
     out.epochMs = millis();
     
     // Calculate absolute voltages
     uint16_t vAbs[4];
+    const uint16_t minV[4] = {3400, 6800,  10200, 13600};
+    const uint16_t maxV[4] = {4200, 8400, 12600, 16800};
     for (uint8_t ch = 0; ch < 4; ch++) {
-        vAbs[ch] = (uint16_t)((acc[ch] / N) * LSB * kDiv[ch]);
+        float avg = (float)acc[ch] / validSamples;
+        vAbs[ch] = (uint16_t)(avg * LSB * kDiv[ch]);
+        
+        // Validação básica das tensões absolutas por canal
+        if (vAbs[ch] < minV[ch] || vAbs[ch] > maxV[ch]) {
+            Serial.printf("[ADS] Tensão absoluta suspeita no canal %d: %dmV\n", ch+1, vAbs[ch]);
+        }
     }
 
     // Calculate differential voltages
@@ -57,8 +105,13 @@ bool ADS_getSample(CellSample &out) {
     return true;
 }
 
-void ADS_raw(int16_t *arr) {
+bool ADS_raw(int16_t *arr) {
+    if (!arr) return false;
+    
     for (uint8_t i = 0; i < 4; i++) {
-        arr[i] = ads.readADC_SingleEnded(i);
+        if (!readSafe(i, arr[i])) {
+            return false;
+        }
     }
+    return true;
 }
