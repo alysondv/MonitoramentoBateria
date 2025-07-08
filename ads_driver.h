@@ -8,6 +8,7 @@
 struct CellSample {
     uint32_t epochMs;    // Timestamp em milissegundos
     uint16_t mv[4];      // Tensões das células em mV
+    uint8_t  soc[4];     // SoC de cada célula em %
     uint16_t total;      // Tensão total do pack
 };
 

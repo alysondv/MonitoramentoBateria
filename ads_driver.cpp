@@ -1,5 +1,6 @@
 #include "ads_driver.h"
 #include <Wire.h>
+#include <math.h>
 
 static Adafruit_ADS1115 ads;
 static constexpr uint8_t N = 8;           // Oversampling count
@@ -48,6 +49,17 @@ bool ADS_init() {
     ads.setGain(GAIN_TWOTHIRDS);  // ±6.144V range
     isInitialized = true;
     return true;
+}
+
+// Função para converter tensão (mV) em SoC (%)
+// Baseado na fórmula: SoC(%) = (V_medida - 3.2) * 100 / (4.2 - 3.2)
+static uint8_t voltageToSoc(uint16_t mv) {
+    const float V_MAX = 4200.0f;
+    const float V_MIN = 3200.0f;
+    float voltage = (float)mv;
+    float soc_f = ((voltage - V_MIN) * 100.0f) / (V_MAX - V_MIN);
+    soc_f = fmaxf(0.0f, fminf(100.0f, soc_f));
+    return (uint8_t)soc_f;
 }
 
 bool ADS_getSample(CellSample &out) {
@@ -101,7 +113,10 @@ bool ADS_getSample(CellSample &out) {
     out.mv[2] = vAbs[2] - vAbs[1];
     out.mv[3] = vAbs[3] - vAbs[2];
     out.total = vAbs[3];
-    
+    // Calcula o SoC para cada célula
+    for (int i = 0; i < 4; i++) {
+        out.soc[i] = voltageToSoc(out.mv[i]);
+    }
     return true;
 }
 

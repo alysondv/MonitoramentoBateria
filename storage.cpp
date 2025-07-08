@@ -11,7 +11,7 @@ static bool openLog(bool writeHeader) {
     }
     // Escreve cabeçalho se o arquivo está vazio
     if (logFile.size() == 0 && writeHeader) {
-        logFile.println("hora,c1,c2,c3,c4,total");
+        logFile.println("hora,c1_mv,c1_soc,c2_mv,c2_soc,c3_mv,c3_soc,c4_mv,c4_soc,total_mv");
         logFile.flush();
     }
     return true;
@@ -47,9 +47,11 @@ bool FS_appendCsv(const CellSample &s) {
     }
     struct tm tm;
     localtime_r(&now, &tm);
-    size_t bytesWritten = logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u\n",
+    size_t bytesWritten = logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
         tm.tm_hour, tm.tm_min, tm.tm_sec,
-        s.mv[0], s.mv[1], s.mv[2], s.mv[3], s.total);
+        s.mv[0], s.soc[0], s.mv[1], s.soc[1],
+        s.mv[2], s.soc[2], s.mv[3], s.soc[3],
+        s.total);
     logFile.flush();
     if (bytesWritten == 0) {
         Serial.println("[FS] Erro ao escrever no log");

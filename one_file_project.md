@@ -101,6 +101,7 @@ void loop() {
 struct CellSample {
     uint32_t epochMs;    // Timestamp em milissegundos
     uint16_t mv[4];      // Tensões das células em mV
+    uint8_t  soc[4];     // SoC de cada célula em %
     uint16_t total;      // Tensão total do pack
 };
 
@@ -136,6 +137,7 @@ void ADS_setKDiv(const float *k);
 ```cpp
 #include "ads_driver.h"
 #include <Wire.h>
+#include <math.h>
 
 static Adafruit_ADS1115 ads;
 static constexpr uint8_t N = 8;           // Oversampling count
@@ -186,6 +188,17 @@ bool ADS_init() {
     return true;
 }
 
+// Função para converter tensão (mV) em SoC (%)
+// Baseado na fórmula: SoC(%) = (V_medida - 3.2) * 100 / (4.2 - 3.2)
+static uint8_t voltageToSoc(uint16_t mv) {
+    const float V_MAX = 4200.0f;
+    const float V_MIN = 3200.0f;
+    float voltage = (float)mv;
+    float soc_f = ((voltage - V_MIN) * 100.0f) / (V_MAX - V_MIN);
+    soc_f = fmaxf(0.0f, fminf(100.0f, soc_f));
+    return (uint8_t)soc_f;
+}
+
 bool ADS_getSample(CellSample &out) {
     if (!isInitialized) {
         Serial.println("[ADS] ADC não inicializado");
@@ -215,13 +228,6 @@ bool ADS_getSample(CellSample &out) {
         return false;
     }
 
-    Serial.printf("[RAW] %lu,%ld,%ld,%ld,%ld\n",
-                  millis(),
-                  acc[0] / validSamples,
-                  acc[1] / validSamples,
-                  acc[2] / validSamples,
-                  acc[3] / validSamples);
-
     out.epochMs = millis();
     
     // Calculate absolute voltages
@@ -244,7 +250,12 @@ bool ADS_getSample(CellSample &out) {
     out.mv[2] = vAbs[2] - vAbs[1];
     out.mv[3] = vAbs[3] - vAbs[2];
     out.total = vAbs[3];
-    
+    // --- INÍCIO DA ALTERAÇÃO ---
+    // Calcula o SoC para cada célula
+    for (int i = 0; i < 4; i++) {
+        out.soc[i] = voltageToSoc(out.mv[i]);
+    }
+    // --- FIM DA ALTERAÇÃO ---
     return true;
 }
 
@@ -306,12 +317,12 @@ bool CFG_load(Calib &c) {
 }
 
 void CFG_save(const Calib &c) {
-    StaticJsonDocument<128> d;
-    for (int i = 0; i < 4; i++) {
-        d["k"][i] = c.kDiv[i];
-    }
     File f = SPIFFS.open("/config.json", "w");
+    if (!f) return;
+    StaticJsonDocument<128> d;
+    for (int i = 0; i < 4; i++) d["k"][i] = c.kDiv[i];
     serializeJson(d, f);
+    f.close();
 }
 ```
 
@@ -323,20 +334,16 @@ void CFG_save(const Calib &c) {
 
 /**
  * Inicializa o sistema de arquivos.
- * @return true se bem sucedido, false em caso de erro.
  */
 bool FS_init();
 
 /**
  * Adiciona uma amostra ao arquivo CSV.
- * @param s Amostra a ser salva.
- * @return true se bem sucedido, false em caso de erro.
  */
 bool FS_appendCsv(const CellSample &s);
 
 /**
  * Limpa todos os logs.
- * @return true se bem sucedido, false em caso de erro.
  */
 bool FS_clearLogs();
 ```
@@ -357,7 +364,7 @@ static bool openLog(bool writeHeader) {
     }
     // Escreve cabeçalho se o arquivo está vazio
     if (logFile.size() == 0 && writeHeader) {
-        logFile.println("hora,c1,c2,c3,c4,total");
+        logFile.println("hora,c1_mv,c1_soc,c2_mv,c2_soc,c3_mv,c3_soc,c4_mv,c4_soc,total_mv");
         logFile.flush();
     }
     return true;
@@ -393,9 +400,11 @@ bool FS_appendCsv(const CellSample &s) {
     }
     struct tm tm;
     localtime_r(&now, &tm);
-    size_t bytesWritten = logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u\n",
+    size_t bytesWritten = logFile.printf("%02d:%02d:%02d,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
         tm.tm_hour, tm.tm_min, tm.tm_sec,
-        s.mv[0], s.mv[1], s.mv[2], s.mv[3], s.total);
+        s.mv[0], s.soc[0], s.mv[1], s.soc[1],
+        s.mv[2], s.soc[2], s.mv[3], s.soc[3],
+        s.total);
     logFile.flush();
     if (bytesWritten == 0) {
         Serial.println("[FS] Erro ao escrever no log");
@@ -421,15 +430,7 @@ bool FS_clearLogs() {
 #pragma once
 #include "ads_driver.h"
 
-/**
- * Inicializa WiFi, servidor HTTP/WS e endpoints.
- */
 void NET_init();
-
-/**
- * Envia uma amostra via WebSocket.
- * @param s Amostra a ser enviada.
- */
 void NET_tick(const CellSample &s);
 ```
 
@@ -454,9 +455,13 @@ const char *SSID = "NEST-Shop";
 const char *PASS = "NDA1T5D0";
 static constexpr long TZ_OFFSET = -3 * 3600;
 
+/* ----------------------------------------------------------
+   Single‑page HTML: Monitor + Setup
+   ---------------------------------------------------------- */
+
 static void putIndex() {
     File f = SPIFFS.open("/index.html", "w");
-    f.print(index_html); // index_html now comes from web_ui.h
+    f.print(index_html);
 }
 
 void NET_init() {
@@ -529,11 +534,16 @@ void NET_init() {
 }
 
 void NET_tick(const CellSample &s) {
-    StaticJsonDocument<192> d;
+    StaticJsonDocument<256> d; 
     char tbuf[9];
     snprintf(tbuf,9,"%02u:%02u:%02u",(s.epochMs/3600000)%24,(s.epochMs/60000)%60,(s.epochMs/1000)%60);
     d["t"] = tbuf;
-    for (uint8_t i = 0; i < 4; i++) d["v"][i] = s.mv[i];
+    JsonArray v_arr = d.createNestedArray("v");
+    JsonArray soc_arr = d.createNestedArray("soc"); 
+    for (uint8_t i = 0; i < 4; i++) {
+        v_arr.add(s.mv[i]);
+        soc_arr.add(s.soc[i]); 
+    }
     d["tot"] = s.total;
     String o;
     serializeJson(d, o);
@@ -596,10 +606,10 @@ a:hover { text-decoration: underline; }
 </div>
 <div id='paneMon' class='pane active'>
   <div class='cards'>
-    <div class='card' onclick="selectCell(0)">C1<div class='battery' id='batt0'></div><span id='v0'>-</span> V</div>
-    <div class='card' onclick="selectCell(1)">C2<div class='battery' id='batt1'></div><span id='v1'>-</span> V</div>
-    <div class='card' onclick="selectCell(2)">C3<div class='battery' id='batt2'></div><span id='v2'>-</span> V</div>
-    <div class='card' onclick="selectCell(3)">C4<div class='battery' id='batt3'></div><span id='v3'>-</span> V</div>
+    <div class='card' onclick="selectCell(0)">C1<div class='battery' id='batt0'></div><span id='v0'>-</span> V | <span id='soc0'>-</span>%</div>
+    <div class='card' onclick="selectCell(1)">C2<div class='battery' id='batt1'></div><span id='v1'>-</span> V | <span id='soc1'>-</span>%</div>
+    <div class='card' onclick="selectCell(2)">C3<div class='battery' id='batt2'></div><span id='v2'>-</span> V | <span id='soc2'>-</span>%</div>
+    <div class='card' onclick="selectCell(3)">C4<div class='battery' id='batt3'></div><span id='v3'>-</span> V | <span id='soc3'>-</span>%</div>
     <div class='card' onclick="selectCell(4)">Total<div class='battery total-battery' id='battTot'></div><span id='tot'>-</span> V</div>
   </div>
   <canvas id='graph'></canvas>
@@ -629,25 +639,59 @@ const ctx = graph.getContext('2d');
 const chart = new Chart(ctx, {type:'line',data:{labels:[],datasets:[{label:'Célula',data:[],borderWidth:2,borderColor:'#2196F3',backgroundColor:'rgba(33, 150, 243, 0.2)',pointRadius:2}]},options:{animation:false,scales:{x:{display:false},y:{min:3,max:4.3}}}});
 const hist=[[],[],[],[],[]]; const labels=[]; const cells=4;
 let ws=new WebSocket('ws://'+location.hostname+'/ws');
-ws.onmessage=e=>{const d=JSON.parse(e.data); const now = new Date().toLocaleTimeString(); labels.push(now); if(labels.length>60) labels.shift(); d.v.forEach((mv,i)=>{const v=mv/1000; document.getElementById('v'+i).textContent = v.toFixed(3); updateBattery('batt'+i, v, false); hist[i].push(v); if(hist[i].length>60) hist[i].shift();}); const total=d.tot/1000; document.getElementById('tot').textContent=total.toFixed(3); updateBattery('battTot',total,true); hist[4].push(total); if(hist[4].length>60) hist[4].shift(); updateGraph();};
-function updateBattery(id,v,isTotal=false){const min=isTotal?3*cells:3,max=isTotal?4.2*cells:4.2;let p=Math.max(0,Math.min(1,(v-min)/(max-min)));const b=document.getElementById(id);b.style.setProperty('--level',(p*100)+'%');let c;const vpc=isTotal?v/cells:v;if(vpc>=3.7)c='#4caf50';else if(vpc>=3.5)c='#ffc107';else c='#f44336';b.style.setProperty('--batt-color',c);}
+ws.onmessage=e=>{
+    const d=JSON.parse(e.data); 
+    const now = new Date().toLocaleTimeString(); 
+    labels.push(now); 
+    if(labels.length>60) labels.shift(); 
+    d.v.forEach((mv,i)=>{
+        const v=mv/1000; 
+        document.getElementById('v'+i).textContent = v.toFixed(3); 
+        const soc = d.soc[i];
+        document.getElementById('soc'+i).textContent = soc;
+        updateBattery('batt'+i, v, soc);
+        hist[i].push(v); 
+        if(hist[i].length>60) hist[i].shift();
+    }); 
+    const total=d.tot/1000; 
+    document.getElementById('tot').textContent=total.toFixed(3); 
+    updateBattery('battTot',total, null, true);
+    hist[4].push(total); 
+    if(hist[4].length>60) hist[4].shift(); 
+    updateGraph();
+};
+
+function updateBattery(id, v, soc, isTotal=false){
+    let p;
+    if (isTotal) {
+        const cells = 4;
+        const min=3.2*cells, max=4.2*cells;
+        p = Math.max(0, Math.min(1, (v-min)/(max-min)));
+    } else {
+        p = soc / 100.0;
+    }
+    const b=document.getElementById(id);
+    b.style.setProperty('--level',(p*100)+'%');
+    let c;
+    const vpc=isTotal?v/4:v;
+    if(vpc>=3.7)c='#4caf50';else if(vpc>=3.5)c='#ffc107';else c='#f44336';
+    b.style.setProperty('--batt-color',c);
+}
 function updateGraph(){chart.data.labels=[...labels];const t=selectedCell===4,n=t?'Total':'C'+(selectedCell+1);chart.data.datasets[0].label=n+' (V)';chart.data.datasets[0].data=[...hist[selectedCell]];chart.options.scales.y=t?{min:3*cells,max:4.2*cells}:{min:3,max:4.3};chart.update();}
 function calib(){const v=[0,1,2,3].map(i=>parseFloat(document.getElementById('in'+i).value)*1000||0);const p=JSON.stringify({v});fetch('/api/calibrate',{method:'POST',headers:{'Content-Type':'application/json'},body:p}).then(r=>r.text()).then(t=>alert("Resposta: "+t)).catch(e=>alert("Erro: "+e));}
 function clearLog(){fetch('/api/clear_logs',{method:'POST'});}
 </script>
 </body>
 </html>
-)rawliteral;
+)rawliteral";
 ```
 
 ---
 ## partitions.csv
-```plaintext
+```
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,data,nvs,0x9000,0x5000,
-otadata,data,ota,0xE000,0x2000,
-app0,app,ota_0,0x10000,0x140000,
-app1,app,ota_1,0x150000,0x140000,
-spiffs,data,spiffs,0x290000,0xC00000,
-coredump,data,coredump,0xE90000,0x10000,
+nvs,      data, nvs,     0x9000,  0x4000,
+phy_init, data, phy,     0xd000,  0x1000,
+factory,  app,  factory, 0x10000, 1M,
+spiffs,   data, spiffs,        ,  2M,
 ```

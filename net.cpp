@@ -95,11 +95,16 @@ void NET_init() {
 }
 
 void NET_tick(const CellSample &s) {
-    StaticJsonDocument<192> d;
+    StaticJsonDocument<256> d; // Aumentado para 256
     char tbuf[9];
     snprintf(tbuf,9,"%02u:%02u:%02u",(s.epochMs/3600000)%24,(s.epochMs/60000)%60,(s.epochMs/1000)%60);
     d["t"] = tbuf;
-    for (uint8_t i = 0; i < 4; i++) d["v"][i] = s.mv[i];
+    JsonArray v_arr = d.createNestedArray("v");
+    JsonArray soc_arr = d.createNestedArray("soc"); // Adicionado
+    for (uint8_t i = 0; i < 4; i++) {
+        v_arr.add(s.mv[i]);
+        soc_arr.add(s.soc[i]); // Adicionado
+    }
     d["tot"] = s.total;
     String o;
     serializeJson(d, o);
