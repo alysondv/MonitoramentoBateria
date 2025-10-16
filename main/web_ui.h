@@ -64,9 +64,9 @@ a:hover { text-decoration: underline; }
     <h3>⚙️ Calibração kDiv</h3>
     <p>Digite tensões medidas (V):</p>
     <div>🔋 C1 <input id='in0'> V</div>
-    <div>🔋 C1+C2 <input id='in1'> V</div>
-    <div>🔋 C1+C2+C3 <input id='in2'> V</div>
-    <div>🔋 Pack <input id='in3'> V</div>
+    <div>🔋 C2 <input id='in1'> V</div>
+    <div>🔋 C3 <input id='in2'> V</div>
+    <div>🔋 C4 <input id='in3'> V</div>
     <button onclick='calib()'>✅ Calibrar</button>
     <h3>🗑️ Logs</h3>
     <button onclick='clearLog()'>🧹 Limpar logs</button>
