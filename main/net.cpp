@@ -16,7 +16,7 @@ const char *SSID = "Mocoto";
 const char *PASS = "1234567i";
 static constexpr long TZ_OFFSET = -3 * 3600;
 
-// Monitor + Setup
+// Grava index.html no SPIFFS
 static void putIndex() {
     File f = SPIFFS.open("/index.html", "w");
     f.print(index_html);
@@ -44,49 +44,94 @@ void NET_init() {
 
     server.on("/", HTTP_GET, [](auto *r){ r->send(SPIFFS, "/index.html", "text/html"); });
     server.on("/download", HTTP_GET, [](auto *r){ r->send(SPIFFS, "/log.csv", "text/csv", true); });
-    server.on("/api/raw", HTTP_GET, [](auto *r){ int16_t raw[4]; ADS_raw(raw); StaticJsonDocument<128> d; for(int i=0;i<4;i++) d["raw"][i]=raw[i]; d["lsb"]=0.1875; String o; serializeJson(d,o); r->send(200,"application/json",o); });
+    server.on("/api/raw", HTTP_GET, [](auto *r){
+        int16_t raw[4];
+        ADS_raw(raw);
+        StaticJsonDocument<128> d;
+        for(int i=0;i<4;i++) d["raw"][i]=raw[i];
+        d["lsb"]=0.1875;
+        String o; serializeJson(d,o);
+        r->send(200,"application/json",o);
+    });
 
+    // Calibração: aceita um ponto (ajusta offsets) ou dois pontos (ajusta ganho e offset)
     server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        // Faz o parse do corpo da requisição JSON
         String body((char*)data, len);
-        StaticJsonDocument<128> d;
+        StaticJsonDocument<256> d;
         if (deserializeJson(d, body)) {
             request->send(400, "text/plain", "Erro de JSON");
             return;
         }
 
-        Calib novaCalib;
-        int16_t raw[4];
-        ADS_raw(raw);
-        JsonArray v_cells = d["v"];
-        float v_cumulative = 0.0f;
-
-        for (int i = 0; i < 4; i++) {
-            // Verifica se a leitura raw do ADC é <= 0
-            if (raw[i] <= 0) {
-                Serial.printf("[CALIB] Leitura raw inválida no canal %d: raw=%d. Abortando.\n", i + 1, raw[i]);
-                request->send(422, "text/plain", "Leitura raw inválida do ADC");
-                return; // Aborta a calibração completamente se um valor for inválido
-            }
-            
-            // Acumula a tensão real medida para cada pino do ADC
-            v_cumulative += (float)v_cells[i];
-            
-            // Calcula o novo fator de calibração
-            novaCalib.kDiv[i] = v_cumulative / (raw[i] * 0.1875f);
+        JsonArray v_cells1 = d["v"];
+        JsonArray v_cells2 = d["v2"]; // opcional
+        if (v_cells1.isNull() || v_cells1.size()!=4) {
+            request->send(400,"text/plain","Payload inválido: 'v'");
+            return;
         }
 
-        // Se o loop completou, os dados são válidos. Aplica e salva
-        ADS_setKDiv(novaCalib.kDiv);
-        CFG_save(novaCalib);
+        // Leitura RAW ponto 1
+        int16_t r1[4];
+        if (!ADS_raw(r1)) { request->send(500,"text/plain","Falha ao ler RAW"); return; }
+
+        // Cumulativos mV do ponto 1
+        float cum1[4]; float acc=0.0f;
+        for (int i=0;i<4;i++){ acc += (float)v_cells1[i] * 1000.0f; cum1[i]=acc; }
+
+        // Carrega calib atual como base
+        Calib cur;
+        if (!CFG_load(cur)) {
+            cur = Calib{{1.043f, 2.114f, 3.022f, 4.039f}, {0,0,0,0}};
+        }
+        Calib outCal = cur;
+        const float lsb = 0.1875f;
+
+        if (!v_cells2.isNull() && v_cells2.size()==4) {
+            // Dois pontos: estima k e offset por canal (reta V = k*R*lsb + o)
+            delay(5);
+            int16_t r2[4];
+            if (!ADS_raw(r2)) { request->send(500,"text/plain","Falha ao ler RAW (ponto 2)"); return; }
+            float cum2[4]; float acc2=0.0f;
+            for (int i=0;i<4;i++){ acc2 += (float)v_cells2[i]*1000.0f; cum2[i]=acc2; }
+
+            for (int i=0;i<4;i++){
+                if (r2[i]==r1[i]) {
+                    // degenerado: ajusta só offset com base no ponto 1
+                    float v_est = cur.kDiv[i]*r1[i]*lsb + cur.oMv[i];
+                    outCal.kDiv[i] = cur.kDiv[i];
+                    outCal.oMv[i]  = cum1[i] - v_est;
+                } else {
+                    float k = (cum2[i]-cum1[i]) / ((r2[i]-r1[i]) * lsb);
+                    float o = cum1[i] - k * r1[i] * lsb;
+                    outCal.kDiv[i]=k; outCal.oMv[i]=o;
+                }
+            }
+        } else {
+            // Um ponto: mantém k e ajusta offsets para alinhar cumulativos
+            for (int i=0;i<4;i++){
+                float v_est = cur.kDiv[i]*r1[i]*lsb + cur.oMv[i];
+                outCal.oMv[i] = cum1[i] - v_est;
+            }
+        }
+
+        ADS_setCalib(outCal.kDiv, outCal.oMv);
+        CFG_save(outCal);
         Serial.println("[CALIB] Nova calibração salva:");
-        for (int i = 0; i < 4; i++) Serial.printf("  kDiv[%d] = %.6f\n", i, novaCalib.kDiv[i]);
-        request->send(200, "text/plain", "Calibração aplicada");
+        for (int i = 0; i < 4; i++) {
+            Serial.printf("  kDiv[%d]=%.6f  oMv[%d]=%.2f\n", i, outCal.kDiv[i], i, outCal.oMv[i]);
+        }
+        request->send(200, "text/plain", "Calibração aplicada (ganho+offset)");
     });
 
-    server.on("/api/clear_logs", HTTP_POST, [](auto *r){ FS_clearLogs(); r->send(200, "text/plain", "CLEARED"); });
-    ws.onEvent([](AsyncWebSocket *srv, AsyncWebSocketClient *cli, AwsEventType type, void *arg, uint8_t *data, size_t len){ if(type==WS_EVT_CONNECT) Serial.println("[WS] cliente conectado"); });
+    server.on("/api/clear_logs", HTTP_POST, [](auto *r){
+        FS_clearLogs();
+        r->send(200, "text/plain", "CLEARED");
+    });
+
+    ws.onEvent([](AsyncWebSocket *srv, AsyncWebSocketClient *cli, AwsEventType type, void *arg, uint8_t *data, size_t len){
+        if(type==WS_EVT_CONNECT) Serial.println("[WS] cliente conectado");
+    });
     server.addHandler(&ws);
     server.begin();
 
@@ -94,15 +139,15 @@ void NET_init() {
 }
 
 void NET_tick(const CellSample &s) {
-    StaticJsonDocument<256> d; 
+    StaticJsonDocument<256> d;
     char tbuf[9];
     snprintf(tbuf,9,"%02u:%02u:%02u",(s.epochMs/3600000)%24,(s.epochMs/60000)%60,(s.epochMs/1000)%60);
     d["t"] = tbuf;
     JsonArray v_arr = d.createNestedArray("v");
-    JsonArray soc_arr = d.createNestedArray("soc"); 
+    JsonArray soc_arr = d.createNestedArray("soc");
     for (uint8_t i = 0; i < 4; i++) {
         v_arr.add(s.mv[i]);
-        soc_arr.add(s.soc[i]); 
+        soc_arr.add(s.soc[i]);
     }
     d["tot"] = s.total;
     String o;

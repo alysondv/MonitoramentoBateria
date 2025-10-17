@@ -37,3 +37,10 @@ bool ADS_raw(int16_t *arr);
  * @param k Array de fatores de divisão.
  */
 void ADS_setKDiv(const float *k);
+
+// Define offsets por canal (mV). Tamanho 4. Pode ser NULL (mantém atual).
+void ADS_setOffsetMv(const float *o);
+
+// Atalho: define kDiv e offsets juntos.
+void ADS_setCalib(const float *k, const float *o);
+

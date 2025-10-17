@@ -2,9 +2,12 @@
 
 /**
  * Estrutura de calibração dos divisores de tensão.
+ * kDiv: ganhos por canal (multiplicativo)
+ * oMv : offsets por canal em mV (aditivo, aplicado no cumulativo)
  */
 struct Calib {
     float kDiv[4];
+    float oMv[4];
 };
 
 /**

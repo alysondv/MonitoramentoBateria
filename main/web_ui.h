@@ -61,12 +61,18 @@ a:hover { text-decoration: underline; }
 </div>
 <div id='paneSet' class='pane'>
   <div class="setup-box">
-    <h3>⚙️ Calibração kDiv</h3>
-    <p>Digite tensões medidas (V):</p>
-    <div>🔋 C1 <input id='in0'> V</div>
+    <h3>⚙️ Calibração (ganho + offset)</h3>
+    <p>Digite as tensões de cada célula (em V). Com um ponto, ajusta <b>offset</b>; com dois pontos, ajusta <b>ganho</b> e <b>offset</b>.</p>
+    <div>🔋 C1 <input id='in0' placeholder="ex: 3.915"> V</div>
     <div>🔋 C2 <input id='in1'> V</div>
     <div>🔋 C3 <input id='in2'> V</div>
     <div>🔋 C4 <input id='in3'> V</div>
+    <details><summary>➕ Segundo ponto (opcional)</summary>
+      <div>🔋 C1 <input id='in0b'> V</div>
+      <div>🔋 C2 <input id='in1b'> V</div>
+      <div>🔋 C3 <input id='in2b'> V</div>
+      <div>🔋 C4 <input id='in3b'> V</div>
+    </details>
     <button onclick='calib()'>✅ Calibrar</button>
     <h3>🗑️ Logs</h3>
     <button onclick='clearLog()'>🧹 Limpar logs</button>
@@ -84,24 +90,24 @@ const chart = new Chart(ctx, {type:'line',data:{labels:[],datasets:[{label:'Cél
 const hist=[[],[],[],[],[]]; const labels=[]; const cells=4;
 let ws=new WebSocket('ws://'+location.hostname+'/ws');
 ws.onmessage=e=>{
-    const d=JSON.parse(e.data); 
-    const now = new Date().toLocaleTimeString(); 
-    labels.push(now); 
-    if(labels.length>60) labels.shift(); 
+    const d=JSON.parse(e.data);
+    const now = new Date().toLocaleTimeString();
+    labels.push(now);
+    if(labels.length>60) labels.shift();
     d.v.forEach((mv,i)=>{
-        const v=mv/1000; 
-        document.getElementById('v'+i).textContent = v.toFixed(3); 
+        const v=mv/1000;
+        document.getElementById('v'+i).textContent = v.toFixed(3);
         const soc = d.soc[i];
         document.getElementById('soc'+i).textContent = soc;
         updateBattery('batt'+i, v, soc);
-        hist[i].push(v); 
+        hist[i].push(v);
         if(hist[i].length>60) hist[i].shift();
-    }); 
-    const total=d.tot/1000; 
-    document.getElementById('tot').textContent=total.toFixed(3); 
+    });
+    const total=d.tot/1000;
+    document.getElementById('tot').textContent=total.toFixed(3);
     updateBattery('battTot',total, null, true);
-    hist[4].push(total); 
-    if(hist[4].length>60) hist[4].shift(); 
+    hist[4].push(total);
+    if(hist[4].length>60) hist[4].shift();
     updateGraph();
 };
 
@@ -122,7 +128,14 @@ function updateBattery(id, v, soc, isTotal=false){
     b.style.setProperty('--batt-color',c);
 }
 function updateGraph(){chart.data.labels=[...labels];const t=selectedCell===4,n=t?'Total':'C'+(selectedCell+1);chart.data.datasets[0].label=n+' (V)';chart.data.datasets[0].data=[...hist[selectedCell]];chart.options.scales.y=t?{min:3*cells,max:4.2*cells}:{min:3,max:4.3};chart.update();}
-function calib(){const v=[0,1,2,3].map(i=>parseFloat(document.getElementById('in'+i).value)*1000||0);const p=JSON.stringify({v});fetch('/api/calibrate',{method:'POST',headers:{'Content-Type':'application/json'},body:p}).then(r=>r.text()).then(t=>alert("Resposta: "+t)).catch(e=>alert("Erro: "+e));}
+function calib(){
+  const v=[0,1,2,3].map(i=>parseFloat(document.getElementById('in'+i).value)||0);
+  const v2fields=[0,1,2,3].map(i=>document.getElementById('in'+i+'b'));
+  const hasV2 = v2fields.every(el=>el && el.value && !isNaN(parseFloat(el.value)));
+  const payload = hasV2 ? {v, v2: v2fields.map(el=>parseFloat(el.value)||0)} : {v};
+  fetch('/api/calibrate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(r=>r.text()).then(t=>alert("Resposta: "+t)).catch(e=>alert("Erro: "+e));
+}
 function clearLog(){fetch('/api/clear_logs',{method:'POST'});}
 </script>
 </body>
